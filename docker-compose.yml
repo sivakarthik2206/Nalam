@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: nalam-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: nalam
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nalam"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nalam-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/nalam
+      - BOLNA_API_KEY=${BOLNA_API_KEY:-}
+      - BOLNA_AGENT_ID_HINDI=${BOLNA_AGENT_ID_HINDI:-}
+      - BOLNA_AGENT_ID_TAMIL=${BOLNA_AGENT_ID_TAMIL:-}
+      - BOLNA_AGENT_ID_ENGLISH=${BOLNA_AGENT_ID_ENGLISH:-}
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
+      - TWILIO_WHATSAPP_FROM=${TWILIO_WHATSAPP_FROM:-whatsapp:+14155238886}
+      - BACKEND_BASE_URL=http://localhost:8000
+      - FRONTEND_BASE_URL=http://localhost:3000
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:
