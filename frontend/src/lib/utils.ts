@@ -1,9 +1,47 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { format, parseISO, isValid } from "date-fns";
+import axios from "axios";
+
+interface ApiErrorBody {
+  detail?: string;
+  message?: string;
+}
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+/**
+ * Convert an unknown request failure into safe, user-facing copy.
+ * Backend details are already validated by FastAPI and are safe to surface;
+ * transport and unexpected errors are intentionally kept generic.
+ */
+export function getApiErrorMessage(error: unknown): string {
+  if (axios.isAxiosError<ApiErrorBody>(error)) {
+    const detail = error.response?.data?.detail ?? error.response?.data?.message;
+    if (detail) return detail;
+    if (error.response) return `The service returned an error (${error.response.status}).`;
+    if (error.request) return "Nalam could not reach the service. Check the connection and try again.";
+  }
+
+  if (error instanceof Error && error.message) return error.message;
+  return "Something went wrong while loading Nalam data. Please try again.";
+}
+
+export function formatMealTiming(value: string): string {
+  switch (value) {
+    case "before_meal":
+      return "Before meal";
+    case "after_meal":
+      return "After meal";
+    case "with_meal":
+      return "With meal";
+    case "no_relation":
+      return "No meal timing";
+    default:
+      return value.replaceAll("_", " ");
+  }
 }
 
 /**

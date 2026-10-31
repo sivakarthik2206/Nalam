@@ -101,7 +101,7 @@ export function AlertsFeed({ alerts, isLoading }: AlertsFeedProps) {
                 </p>
                 <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[11px]">
                   <Link
-                    href={`/admin/patients/${alert.patient_id}`}
+                    href={`/family/${alert.patient_id}`}
                     className="text-emerald-700 hover:underline font-semibold"
                   >
                     View Patient &rarr;

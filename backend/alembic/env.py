@@ -5,6 +5,7 @@ from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import pool
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.config import settings
@@ -14,7 +15,12 @@ from app.models import Base  # noqa: F401 — registers all models for autogener
 config = context.config
 
 # Set sqlalchemy.url dynamically from our app settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+_migration_url = settings.effective_database_url
+if _migration_url.startswith("postgres://"):
+    _migration_url = "postgresql+asyncpg://" + _migration_url.removeprefix("postgres://")
+elif _migration_url.startswith("postgresql://"):
+    _migration_url = "postgresql+asyncpg://" + _migration_url.removeprefix("postgresql://")
+config.set_main_option("sqlalchemy.url", _migration_url)
 
 # Interpret the config file for Python logging
 if config.config_file_name is not None:
@@ -37,7 +43,7 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def do_run_migrations(connection) -> None:  # noqa: ANN001
+def do_run_migrations(connection: Connection) -> None:
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()

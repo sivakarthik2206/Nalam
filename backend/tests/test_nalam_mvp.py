@@ -539,8 +539,9 @@ def _make_scheduler_with_mock_db(empty_db: bool = True):
         # No existing retry logs → proceed to schedule
         no_rows = MagicMock()
         no_rows.scalars.return_value.all.return_value = []
+        existing_log = MagicMock()
         no_log = MagicMock()
-        no_log.scalar_one_or_none.return_value = None
+        no_log.scalar_one_or_none.return_value = existing_log
         mock_session.execute = AsyncMock(side_effect=[no_rows, no_log])
     else:
         # 2 existing retry logs → cap hit
@@ -556,7 +557,7 @@ def _make_scheduler_with_mock_db(empty_db: bool = True):
 
     mock_twilio = AsyncMock()
     mock_twilio.format_alert = MagicMock(return_value="msg")
-    mock_twilio.send_whatsapp = AsyncMock()
+    mock_twilio.send_whatsapp = AsyncMock(return_value={"sid": "SMtest"})
 
     svc = SchedulerService(
         bolna_service=AsyncMock(),

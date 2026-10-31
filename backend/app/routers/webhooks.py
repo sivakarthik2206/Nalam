@@ -1,427 +1,493 @@
-"""Bolna AI webhook endpoints — post-call, real-time function call, follow-up."""
+"""Authenticated, idempotent Bolna callback endpoints."""
 
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
 import logging
+import os
 import uuid
-from typing import Any
+from collections.abc import Mapping
+from typing import Final
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.alerts import evaluate_escalations, send_alert_notifications
 from app.database import get_db
-from app.models import AdherenceLog, Medication, Patient
-from app.schemas import (
-    BolnaFunctionPayload,
-    BolnaFunctionResponse,
-    BolnaWebhookPayload,
+from app.models import (
+    AdherenceLog,
+    AdherenceResponseEnum,
+    CallRecord,
+    CallStatusEnum,
+    Medication,
+    Patient,
 )
+from app.schemas import BolnaFunctionResponse, BolnaWebhookPayload
 from app.services.adherence_engine import AdherenceEngine
-from app.services.twilio_service import TwilioService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
-# Bolna call_status values that indicate call was not answered
-_NO_ANSWER_STATUSES = {"no_answer", "busy", "failed", "no-answer", "unanswered", "canceled"}
+_ALLOWED_OUTCOMES: Final[set[str]] = {
+    member.value for member in AdherenceResponseEnum
+}
+_NO_ANSWER_STATUSES: Final[set[str]] = {
+    "busy",
+    "failed",
+    "no-answer",
+    "no_answer",
+    "unanswered",
+    "canceled",
+    "cancelled",
+}
+_FINAL_STATUSES: Final[set[str]] = _NO_ANSWER_STATUSES | {
+    "completed",
+}
+_CALL_STATUS_MAP: Final[dict[str, CallStatusEnum]] = {
+    "scheduled": CallStatusEnum.scheduled,
+    "queued": CallStatusEnum.scheduled,
+    "initiated": CallStatusEnum.initiated,
+    "ringing": CallStatusEnum.ringing,
+    "answered": CallStatusEnum.answered,
+    "in-progress": CallStatusEnum.in_progress,
+    "in_progress": CallStatusEnum.in_progress,
+    "completed": CallStatusEnum.completed,
+    "no-answer": CallStatusEnum.no_answer,
+    "no_answer": CallStatusEnum.no_answer,
+    "busy": CallStatusEnum.busy,
+    "failed": CallStatusEnum.failed,
+    "canceled": CallStatusEnum.cancelled,
+    "cancelled": CallStatusEnum.cancelled,
+    "call-disconnected": CallStatusEnum.disconnected,
+    "call_disconnected": CallStatusEnum.disconnected,
+}
 
 
-# =====================================================================
-# 1. Post-call completion webhook
-# =====================================================================
+def _normalise_outcome(value: object) -> str:
+    aliases = {
+        "taken": "TAKEN",
+        "not_taken": "MISSED",
+        "missed": "MISSED",
+        "side_effect": "SIDE_EFFECT",
+        "no_answer": "NO_ANSWER",
+        "stock_out": "STOCK_OUT",
+        "callback_requested": "CALLBACK_REQUESTED",
+        "rescheduled": "CALLBACK_REQUESTED",
+    }
+    raw = str(value).strip()
+    return aliases.get(raw.lower(), raw.upper())
 
 
-@router.post(
-    "/bolna",
-    summary="Receive call completion data from Bolna",
-    status_code=status.HTTP_200_OK,
-)
-async def bolna_call_completed(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Receive raw JSON post-call completion webhook from Bolna.
-    Extracts call_id, recipient_phone, call_status, transcript, extracted_data.
-    Logs adherence outcome, evaluates escalation rules, sends alerts via WhatsApp,
-    and returns 200 OK.
-    """
+def _clean_phone(value: object) -> str:
+    phone = str(value).strip()
+    if phone.lower().startswith("whatsapp:"):
+        phone = phone[9:]
+    return phone
+
+
+async def _verified_json(request: Request) -> dict[str, object]:
+    """Verify Bolna's HMAC signature before parsing or using callback data."""
+    raw_body = await request.body()
+    secret = os.getenv("BOLNA_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Bolna webhook verification is not configured",
+        )
+
+    provided = (
+        request.headers.get("x-bolna-signature")
+        or request.headers.get("x-webhook-signature")
+        or ""
+    ).strip()
+    static_secret = request.headers.get("x-bolna-webhook-secret", "").strip()
+    if static_secret and hmac.compare_digest(static_secret, secret):
+        provided = ""
+    elif not provided:
+        logger.warning("Rejected Bolna webhook without signature")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing webhook signature")
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    provided_hex = provided.removeprefix("sha256=").strip()
+    if provided and (not provided_hex or not hmac.compare_digest(provided_hex, expected)):
+        logger.warning("Rejected Bolna webhook with invalid signature")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
+
     try:
-        body: dict[str, Any] = await request.json()
-    except Exception:
-        body = {}
+        parsed = json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid webhook JSON") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Webhook body must be an object")
+    return dict(parsed)
 
-    logger.info("Bolna webhook raw payload received: %s", body)
 
-    # 1. Extract from Bolna payload
-    call_id = (
-        body.get("call_id")
-        or body.get("id")
-        or (body.get("telephony_data") or {}).get("call_id")
-        or ""
-    )
-    recipient_phone = (
-        body.get("recipient_phone")
-        or body.get("recipient_phone_number")
-        or body.get("phone")
-        or (body.get("telephony_data") or {}).get("to")
-        or ""
-    )
-    call_status_raw = (
-        body.get("call_status")
-        or body.get("status")
-        or ""
-    )
-    call_duration = body.get("call_duration") or body.get("duration")
+def _validate_payload_contract(payload: BolnaWebhookPayload, event_id: str) -> None:
+    if not event_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="bolna_call_id or X-Bolna-Event-ID is required for idempotency",
+        )
+    try:
+        uuid.UUID(payload.patient_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid patient_id") from exc
+    if payload.medication_id:
+        try:
+            uuid.UUID(payload.medication_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid medication_id") from exc
 
-    extracted_data = (
-        body.get("extracted_data")
-        or body.get("user_data")
-        or {}
-    )
+    outcome = payload._normalized_outcome
+    if outcome not in _ALLOWED_OUTCOMES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unsupported adherence outcome")
+    if outcome == "SIDE_EFFECT" and payload.side_effect_noted is False:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="SIDE_EFFECT requires side_effect_noted=true")
+    if outcome == "TAKEN" and payload.retry_required:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="TAKEN cannot require a retry")
+    if payload.notes and len(payload.notes) > 2000:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="notes is too long")
+    if payload.call_duration is not None and not 0 <= payload.call_duration <= 86_400:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid call_duration")
 
-    # 2. From extracted_data, get: patient_id, medication_id, time_slot, outcome
-    patient_id_raw = extracted_data.get("patient_id") or body.get("patient_id")
-    medication_id_raw = extracted_data.get("medication_id") or body.get("medication_id")
-    time_slot = extracted_data.get("time_slot", "morning")
-    outcome_str = (
-        extracted_data.get("outcome")
-        or extracted_data.get("response")
-        or "no_answer"
-    )
-    side_effect_details = extracted_data.get("side_effect_details")
-    notes = extracted_data.get("notes")
 
-    # 3. If call_status indicates call was not answered, force NO_ANSWER
-    if str(call_status_raw).lower() in _NO_ANSWER_STATUSES:
-        outcome_str = "no_answer"
-
-    # 4. Resolve patient
+async def _find_patient_and_medication(
+    db: AsyncSession,
+    *,
+    patient_id_raw: object,
+    recipient_phone: object,
+    medication_id_raw: object,
+) -> tuple[Patient, Medication]:
     patient: Patient | None = None
     if patient_id_raw:
         try:
-            p_uuid = uuid.UUID(str(patient_id_raw))
-            patient = (
-                await db.execute(select(Patient).where(Patient.id == p_uuid))
-            ).scalar_one_or_none()
-        except ValueError:
-            pass
-
-    if not patient and recipient_phone:
+            patient_id = uuid.UUID(str(patient_id_raw))
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid patient_id") from exc
         patient = (
-            await db.execute(select(Patient).where(Patient.phone == recipient_phone))
+            await db.execute(
+                select(Patient).where(Patient.id == patient_id).with_for_update()
+            )
         ).scalar_one_or_none()
+    if patient is None and recipient_phone:
+        patient = (
+            await db.execute(
+                select(Patient).where(Patient.phone == _clean_phone(recipient_phone)).with_for_update()
+            )
+        ).scalar_one_or_none()
+    if not patient or not patient.is_active:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active patient not found")
 
-    if not patient:
-        logger.warning(
-            "Webhook received for unknown patient (phone=%s, id=%s)",
-            recipient_phone, patient_id_raw,
-        )
-        return {"status": "ignored", "reason": "patient_not_found"}
-
-    # 5. Resolve medication
     medication_id: uuid.UUID | None = None
     if medication_id_raw:
         try:
             medication_id = uuid.UUID(str(medication_id_raw))
-        except ValueError:
-            logger.warning("Invalid medication_id in extracted_data: %s", medication_id_raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid medication_id") from exc
+    query = select(Medication).where(
+        and_(
+            Medication.patient_id == patient.id,
+            Medication.is_active.is_(True),
+        )
+    )
+    if medication_id:
+        query = query.where(Medication.id == medication_id)
+    medication = (await db.execute(query.limit(1))).scalar_one_or_none()
+    if not medication:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Active medication not found for patient")
+    return patient, medication
 
-    if not medication_id:
-        med = (
-            await db.execute(
-                select(Medication)
-                .where(
-                    Medication.patient_id == patient.id,
-                    Medication.is_active.is_(True),
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if med:
-            medication_id = med.id
-        else:
-            logger.warning("No active medication for patient %s", patient.id)
-            return {"status": "ignored", "reason": "no_active_medication"}
 
-    # 6. Log response
+async def _existing_event(
+    db: AsyncSession,
+    *,
+    event_id: str,
+    patient_id: uuid.UUID,
+    medication_id: uuid.UUID,
+) -> AdherenceLog | None:
+    existing = (
+        await db.execute(
+            select(AdherenceLog).where(AdherenceLog.bolna_call_id == event_id)
+        )
+    ).scalar_one_or_none()
+    if existing and (
+        existing.patient_id != patient_id or existing.medication_id != medication_id
+    ):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Event identifier already belongs to another dose")
+    return existing
+
+
+async def _record_outcome(
+    db: AsyncSession,
+    *,
+    patient: Patient,
+    medication: Medication,
+    payload: BolnaWebhookPayload,
+    event_id: str,
+    mark_previous_follow_up: bool = False,
+    provider_status: str = "completed",
+) -> tuple[AdherenceLog, list, bool]:
+    existing = await _existing_event(
+        db,
+        event_id=event_id,
+        patient_id=patient.id,
+        medication_id=medication.id,
+    )
+    if existing:
+        logger.info("Duplicate Bolna event ignored event_id=%s log_id=%s", event_id, existing.id)
+        return existing, [], True
+
     engine = AdherenceEngine(db)
     log = await engine.log_response(
         patient_id=patient.id,
-        medication_id=medication_id,
-        time_slot=time_slot,
-        response=outcome_str,
-        side_effect_details=side_effect_details,
-        bolna_call_id=str(call_id) if call_id else None,
-        call_duration=int(call_duration) if call_duration is not None else None,
-        notes=notes,
+        medication_id=medication.id,
+        time_slot=payload.time_slot or "morning",
+        response=payload._normalized_outcome.lower(),
+        side_effect_details=payload.side_effect_notes,
+        bolna_call_id=event_id,
+        call_duration=payload.call_duration,
+        notes=payload._resolved_notes,
+        idempotency_key=f"bolna:{event_id}:{patient.id}:{medication.id}",
+        source="voice",
     )
-
-    # 7. Escalation checks
-    from app.alerts import evaluate_escalations
-    alerts = await evaluate_escalations(db, patient.id, log)
-
-    # 8. Send notifications
-    twilio: TwilioService = request.app.state.twilio_service
-    await _send_alert_notifications(twilio, alerts, patient, side_effect_details or notes)
-
-    # 9. Schedule retry if needed
-    outcome_upper = log.outcome.value
-    if outcome_upper in ("MISSED", "NO_ANSWER"):
-        try:
-            scheduler = request.app.state.scheduler_service
-            await scheduler.schedule_retry_call(
-                patient_id=str(patient.id),
-                medication_id=str(medication_id),
-                log_id=str(log.id),
-                attempt_number=1,
+    call_record = (
+        await db.execute(select(CallRecord).where(CallRecord.provider_call_id == event_id))
+    ).scalar_one_or_none()
+    call_status = _CALL_STATUS_MAP.get(provider_status, CallStatusEnum.completed)
+    if call_record is None:
+        call_record = CallRecord(
+            patient_id=patient.id,
+            provider_call_id=event_id,
+            status=call_status,
+            outcome=log.outcome,
+            failure_reason=("provider_call_failed" if call_status == CallStatusEnum.failed else None),
+            idempotency_key=f"bolna-call:{event_id}",
+        )
+        db.add(call_record)
+        await db.flush()
+    else:
+        call_record.status = call_status
+        call_record.outcome = log.outcome
+    log.call_record_id = call_record.id
+    if mark_previous_follow_up:
+        previous = (
+            await db.execute(
+                select(AdherenceLog)
+                .where(
+                    and_(
+                        AdherenceLog.patient_id == patient.id,
+                        AdherenceLog.medication_id == medication.id,
+                        AdherenceLog.follow_up_needed.is_(True),
+                        AdherenceLog.follow_up_completed.is_(False),
+                        AdherenceLog.id != log.id,
+                    )
+                )
+                .order_by(AdherenceLog.created_at.desc())
+                .limit(1)
             )
-        except Exception:
-            logger.exception("Failed to schedule retry call for patient %s", patient.id)
+        ).scalar_one_or_none()
+        if previous:
+            previous.follow_up_completed = True
+    alerts = await evaluate_escalations(db, patient.id, log)
+    await db.commit()
+    return log, alerts, False
 
+
+async def _finish_function_event(
+    payload: BolnaWebhookPayload,
+    request: Request,
+    db: AsyncSession,
+    *,
+    mark_previous_follow_up: bool = False,
+) -> BolnaFunctionResponse:
+    event_id = payload.bolna_call_id or request.headers.get("x-bolna-event-id", "")
+    _validate_payload_contract(payload, event_id)
+    patient, medication = await _find_patient_and_medication(
+        db,
+        patient_id_raw=payload.patient_id,
+        recipient_phone=None,
+        medication_id_raw=payload.medication_id,
+    )
+    log, alerts, duplicate = await _record_outcome(
+        db,
+        patient=patient,
+        medication=medication,
+        payload=payload,
+        event_id=event_id,
+        mark_previous_follow_up=mark_previous_follow_up,
+    )
+    if duplicate:
+        return BolnaFunctionResponse(status="duplicate" if duplicate else "logged", message="Thank you")
+
+    delivered, failed = await send_alert_notifications(
+        request.app.state.twilio_service,
+        alerts,
+        patient,
+        db=db,
+    )
+    logger.info(
+        "Bolna outcome processed patient=%s log_id=%s alerts=%d delivered=%d failed=%d",
+        patient.id,
+        log.id,
+        len(alerts),
+        delivered,
+        failed,
+    )
+    if payload._normalized_outcome in {"MISSED", "NO_ANSWER", "CALLBACK_REQUESTED"}:
+        await request.app.state.scheduler_service.schedule_retry_call(
+            patient_id=str(patient.id),
+            medication_id=str(medication.id),
+            log_id=str(log.id),
+            attempt_number=1,
+        )
+    return BolnaFunctionResponse(status="logged", message="Thank you")
+
+
+@router.post("/bolna", status_code=status.HTTP_200_OK)
+async def bolna_call_completed(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """Process only authenticated final Bolna execution events."""
+    body = await _verified_json(request)
+    call_id = str(
+        body.get("execution_id")
+        or body.get("call_id")
+        or body.get("id")
+        or (body.get("telephony_data") or {}).get("call_id", "")
+    ).strip()
+    status_raw = str(body.get("call_status") or body.get("status") or "").strip().lower()
+    if not call_id:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Bolna execution_id is required")
+    if status_raw and status_raw not in _FINAL_STATUSES:
+        patient_id_raw = body.get("patient_id") or (
+            body.get("user_data") or {}
+        ).get("patient_id") if isinstance(body.get("user_data") or {}, Mapping) else body.get("patient_id")
+        recipient_phone = body.get("recipient_phone_number") or body.get("recipient_phone") or body.get("phone")
+        patient: Patient | None = None
+        if patient_id_raw:
+            try:
+                patient = (
+                    await db.execute(
+                        select(Patient).where(Patient.id == uuid.UUID(str(patient_id_raw))).with_for_update()
+                    )
+                ).scalar_one_or_none()
+            except ValueError:
+                patient = None
+        if patient is None and recipient_phone:
+            patient = (
+                await db.execute(
+                    select(Patient).where(Patient.phone == _clean_phone(recipient_phone)).with_for_update()
+                )
+            ).scalar_one_or_none()
+        if patient is not None:
+            record = (
+                await db.execute(select(CallRecord).where(CallRecord.provider_call_id == call_id))
+            ).scalar_one_or_none()
+            if record is None:
+                record = CallRecord(
+                    patient_id=patient.id,
+                    provider_call_id=call_id,
+                    status=_CALL_STATUS_MAP.get(status_raw, CallStatusEnum.initiated),
+                    idempotency_key=f"bolna-call:{call_id}",
+                )
+                db.add(record)
+            else:
+                record.status = _CALL_STATUS_MAP.get(status_raw, record.status)
+            await db.commit()
+        return {"status": "accepted", "reason": "lifecycle_status", "execution_id": call_id}
+
+    extracted = body.get("extracted_data") or body.get("user_data") or {}
+    if not isinstance(extracted, Mapping):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid extracted_data")
+    patient_id_raw = extracted.get("patient_id") or body.get("patient_id")
+    medication_id_raw = extracted.get("medication_id") or body.get("medication_id")
+    recipient_phone = body.get("recipient_phone_number") or body.get("recipient_phone") or body.get("phone")
+    raw_outcome = extracted.get("outcome") or extracted.get("response")
+    if status_raw in _NO_ANSWER_STATUSES:
+        raw_outcome = "NO_ANSWER"
+    if raw_outcome is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Completed event has no adherence outcome")
+    outcome = _normalise_outcome(raw_outcome)
+    payload_data: dict[str, object] = {
+        "patient_id": str(patient_id_raw or ""),
+        "medication_id": str(medication_id_raw) if medication_id_raw else None,
+        "outcome": outcome,
+        "side_effect_noted": outcome == "SIDE_EFFECT",
+        "retry_required": outcome in {"MISSED", "NO_ANSWER", "CALLBACK_REQUESTED"},
+        "notes": extracted.get("notes") or extracted.get("side_effect_notes") or extracted.get("response_text"),
+        "side_effect_notes": extracted.get("side_effect_details") or extracted.get("side_effect_notes"),
+        "time_slot": extracted.get("time_slot") or "morning",
+        "bolna_call_id": call_id,
+        "call_duration": body.get("call_duration") or body.get("duration"),
+    }
+    payload = BolnaWebhookPayload.model_validate(payload_data)
+    _validate_payload_contract(payload, call_id)
+    patient, medication = await _find_patient_and_medication(
+        db,
+        patient_id_raw=patient_id_raw,
+        recipient_phone=recipient_phone,
+        medication_id_raw=medication_id_raw,
+    )
+    log, alerts, duplicate = await _record_outcome(
+        db,
+        patient=patient,
+        medication=medication,
+        payload=payload,
+        event_id=call_id,
+        provider_status=status_raw or "completed",
+    )
+    if alerts:
+        delivered, failed = await send_alert_notifications(
+            request.app.state.twilio_service,
+            alerts,
+            patient,
+            db=db,
+        )
+        logger.info("Post-call alerts delivered=%d failed=%d", delivered, failed)
+    if not duplicate and payload._normalized_outcome in {"MISSED", "NO_ANSWER", "CALLBACK_REQUESTED"}:
+        await request.app.state.scheduler_service.schedule_retry_call(
+            patient_id=str(patient.id),
+            medication_id=str(medication.id),
+            log_id=str(log.id),
+            attempt_number=1,
+        )
     return {
         "status": "processed",
-        "call_id": call_id,
+        "execution_id": call_id,
         "adherence_log_id": str(log.id),
         "alerts_created": len(alerts),
     }
 
 
-# =====================================================================
-# 2. Real-time function call endpoint hit BY Bolna DURING the call
-# =====================================================================
-
-
-@router.post(
-    "/bolna/function",
-    response_model=BolnaFunctionResponse,
-    summary="Real-time function call hit by Bolna during the call",
-    status_code=status.HTTP_200_OK,
-)
+@router.post("/bolna/function", response_model=BolnaFunctionResponse, status_code=status.HTTP_200_OK)
 async def bolna_function_call(
     payload: BolnaWebhookPayload,
     request: Request,
     db: AsyncSession = Depends(get_db),
-):
-    """
-    Real-time function call endpoint hit BY Bolna DURING the call.
-    Accepts both new spec shape and legacy shape.
-    Immediately logs response, runs escalation checks, fires WhatsApp alert
-    to family if side_effect, and returns in < 2 seconds so the call doesn't stall.
-    """
-    normalised_outcome = payload._normalized_outcome
-    logger.info(
-        "Bolna function call during call — patient=%s med=%s outcome=%s",
-        payload.patient_id,
-        payload.medication_id,
-        normalised_outcome,
-    )
-
-    try:
-        patient_id = uuid.UUID(payload.patient_id)
-        medication_id = uuid.UUID(payload.medication_id) if payload.medication_id else None
-
-        # Resolve medication if not given
-        if not medication_id:
-            med = (
-                await db.execute(
-                    select(Medication)
-                    .where(
-                        Medication.patient_id == patient_id,
-                        Medication.is_active.is_(True),
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if med:
-                medication_id = med.id
-
-        if not medication_id:
-            logger.warning("No medication_id resolved for patient %s", patient_id)
-            return BolnaFunctionResponse(status="logged", message="Thank you")
-
-        engine = AdherenceEngine(db)
-
-        # 1. Log the response (pass lowercase for legacy compat; engine normalises it)
-        log = await engine.log_response(
-            patient_id=patient_id,
-            medication_id=medication_id,
-            time_slot=payload.time_slot or "morning",
-            response=normalised_outcome.lower(),
-            side_effect_details=payload.side_effect_notes,
-            bolna_call_id=payload.bolna_call_id,
-            call_duration=payload.call_duration,
-            notes=payload._resolved_notes,
-        )
-
-        # 2. Escalation checks
-        from app.alerts import evaluate_escalations
-        alerts = await evaluate_escalations(db, patient_id, log)
-
-        # 3. If side_effect or alerts: fire WhatsApp alert
-        if normalised_outcome == "SIDE_EFFECT" and alerts:
-            twilio: TwilioService = request.app.state.twilio_service
-            patient = (
-                await db.execute(select(Patient).where(Patient.id == patient_id))
-            ).scalar_one_or_none()
-            if patient:
-                await _send_alert_notifications(
-                    twilio, alerts, patient, payload._resolved_notes
-                )
-
-        # 4. Schedule retry if needed
-        if normalised_outcome in ("MISSED", "NO_ANSWER") or payload.retry_required:
-            try:
-                scheduler = request.app.state.scheduler_service
-                await scheduler.schedule_retry_call(
-                    patient_id=str(patient_id),
-                    medication_id=str(medication_id),
-                    log_id=str(log.id),
-                    attempt_number=1,
-                )
-            except Exception:
-                logger.exception("Failed to schedule retry for patient %s", patient_id)
-
-        return BolnaFunctionResponse(status="logged", message="Thank you")
-
-    except Exception:
-        logger.exception("Bolna function call failed during call execution")
-        return BolnaFunctionResponse(status="logged", message="Thank you")
+) -> BolnaFunctionResponse:
+    """Process one authenticated real-time function/tool event."""
+    body = await _verified_json(request)
+    if not payload.bolna_call_id:
+        provider_event_id = body.get("execution_id") or body.get("call_id") or body.get("id")
+        if isinstance(provider_event_id, str):
+            payload.bolna_call_id = provider_event_id
+    return await _finish_function_event(payload, request, db)
 
 
-# =====================================================================
-# 3. Dedicated endpoint for follow-up call results
-# =====================================================================
-
-
-@router.post(
-    "/bolna/follow-up",
-    response_model=BolnaFunctionResponse,
-    summary="Dedicated endpoint for follow-up call results",
-    status_code=status.HTTP_200_OK,
-)
+@router.post("/bolna/follow-up", response_model=BolnaFunctionResponse, status_code=status.HTTP_200_OK)
 async def bolna_follow_up(
     payload: BolnaWebhookPayload,
     request: Request,
     db: AsyncSession = Depends(get_db),
-):
-    """
-    Dedicated endpoint for follow-up call results.
-    Logs response, marks original log's follow_up_completed = True,
-    runs escalation checks, and returns {"status": "logged", "message": "Thank you"}.
-    """
-    normalised_outcome = payload._normalized_outcome
-    logger.info(
-        "Bolna follow-up call received — patient=%s med=%s outcome=%s",
-        payload.patient_id,
-        payload.medication_id,
-        normalised_outcome,
-    )
-
-    try:
-        patient_id = uuid.UUID(payload.patient_id)
-        medication_id = uuid.UUID(payload.medication_id) if payload.medication_id else None
-
-        if not medication_id:
-            med = (
-                await db.execute(
-                    select(Medication)
-                    .where(
-                        Medication.patient_id == patient_id,
-                        Medication.is_active.is_(True),
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if med:
-                medication_id = med.id
-
-        if not medication_id:
-            return BolnaFunctionResponse(status="logged", message="Thank you")
-
-        engine = AdherenceEngine(db)
-
-        # 1. Log the response
-        log = await engine.log_response(
-            patient_id=patient_id,
-            medication_id=medication_id,
-            time_slot=payload.time_slot or "morning",
-            response=normalised_outcome.lower(),
-            side_effect_details=payload.side_effect_notes,
-            bolna_call_id=payload.bolna_call_id,
-            call_duration=payload.call_duration,
-            notes=payload._resolved_notes,
-        )
-
-        # 2. Mark the original log's follow_up_completed = True
-        original_q = (
-            select(AdherenceLog)
-            .where(
-                and_(
-                    AdherenceLog.patient_id == patient_id,
-                    AdherenceLog.medication_id == medication_id,
-                    AdherenceLog.follow_up_needed.is_(True),
-                    AdherenceLog.follow_up_completed.is_(False),
-                    AdherenceLog.id != log.id,
-                )
-            )
-            .order_by(AdherenceLog.created_at.desc())
-            .limit(1)
-        )
-        original_log = (await db.execute(original_q)).scalar_one_or_none()
-        if original_log:
-            original_log.follow_up_completed = True
-            logger.info("Marked previous log %s follow_up_completed = True", original_log.id)
-
-        # 3. Escalation checks
-        from app.alerts import evaluate_escalations
-        alerts = await evaluate_escalations(db, patient_id, log)
-
-        # 4. If side_effect, immediately notify family
-        if normalised_outcome == "SIDE_EFFECT" and alerts:
-            twilio: TwilioService = request.app.state.twilio_service
-            patient = (
-                await db.execute(select(Patient).where(Patient.id == patient_id))
-            ).scalar_one_or_none()
-            if patient:
-                await _send_alert_notifications(
-                    twilio, alerts, patient, payload._resolved_notes
-                )
-
-        return BolnaFunctionResponse(status="logged", message="Thank you")
-
-    except Exception:
-        logger.exception("Bolna follow-up call handling failed")
-        return BolnaFunctionResponse(status="logged", message="Thank you")
-
-
-# =====================================================================
-# Helper
-# =====================================================================
-
-
-async def _send_alert_notifications(
-    twilio: TwilioService,
-    alerts: list,
-    patient: Patient,
-    details: str | None = None,
-) -> None:
-    """Send WhatsApp messages to family contact for generated alerts."""
-    for alert in alerts:
-        if alert.sent_to and alert.channel.value == "whatsapp":
-            try:
-                body = twilio.format_alert(
-                    alert_type=alert.alert_type.value,
-                    patient_name=patient.name,
-                    details=alert.message,
-                    language=patient.language.value,
-                )
-                await twilio.send_whatsapp(to=alert.sent_to, body=body)
-                logger.info(
-                    "WhatsApp alert (%s) sent to %s for patient %s",
-                    alert.alert_type.value,
-                    alert.sent_to,
-                    patient.name,
-                )
-            except Exception:
-                logger.exception("Failed to send WhatsApp alert to %s", alert.sent_to)
+) -> BolnaFunctionResponse:
+    """Process a follow-up outcome and close the prior pending follow-up."""
+    body = await _verified_json(request)
+    if not payload.bolna_call_id:
+        provider_event_id = body.get("execution_id") or body.get("call_id") or body.get("id")
+        if isinstance(provider_event_id, str):
+            payload.bolna_call_id = provider_event_id
+    return await _finish_function_event(payload, request, db, mark_previous_follow_up=True)

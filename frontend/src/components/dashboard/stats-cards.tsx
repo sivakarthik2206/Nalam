@@ -20,6 +20,7 @@ export function StatsCards({
   isLoading,
 }: StatsCardsProps) {
   const adherenceStyle = getAdherenceColor(avgAdherence7d);
+  const hasPatients = totalPatients > 0;
 
   if (isLoading) {
     return (
@@ -69,10 +70,12 @@ export function StatsCards({
             </p>
             <div className="flex items-baseline gap-2 mt-1">
               <span className="text-2xl sm:text-3xl font-bold text-slate-900">
-                {avgAdherence7d}%
+                {hasPatients ? `${avgAdherence7d}%` : "—"}
               </span>
               <span className={`text-xs font-medium ${adherenceStyle.text}`}>
-                {avgAdherence7d >= 80
+                {!hasPatients
+                  ? "No patients"
+                  : avgAdherence7d >= 80
                   ? "Optimal"
                   : avgAdherence7d >= 60
                   ? "Moderate"
@@ -123,7 +126,7 @@ export function StatsCards({
             </p>
             <div className="flex items-baseline gap-2 mt-1">
               <span className="text-2xl sm:text-3xl font-bold text-slate-900">
-                {refillsDue}
+                {hasPatients ? refillsDue : "—"}
               </span>
               <span className="text-xs text-amber-600 font-medium">Patients</span>
             </div>

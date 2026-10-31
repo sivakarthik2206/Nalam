@@ -3,6 +3,7 @@
 import logging
 import uuid
 from datetime import date as date_type, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, func, select
@@ -54,46 +55,19 @@ async def get_adherence_score(
         raise HTTPException(status_code=404, detail="Patient not found")
 
     engine = AdherenceEngine(db)
-    score_7d = await engine.compute_adherence_score(patient_id, 7)
-    score_30d = await engine.compute_adherence_score(patient_id, 30)
-
-    # Total expected doses in requested window
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    meds = (
-        await db.execute(
-            select(Medication).where(
-                and_(Medication.patient_id == patient_id, Medication.is_active.is_(True))
-            )
-        )
-    ).scalars().all()
-
-    total_expected = 0
-    for m in meds:
-        freq = m.frequency if isinstance(m.frequency, list) else []
-        total_expected += len(freq) * days
-
-    taken_q = (
-        select(func.count())
-        .select_from(AdherenceLog)
-        .where(
-            and_(
-                AdherenceLog.patient_id == patient_id,
-                AdherenceLog.created_at >= since,
-                AdherenceLog.outcome == AdherenceResponseEnum.TAKEN,
-            )
-        )
-    )
-    total_taken = (await db.execute(taken_q)).scalar() or 0
+    metrics_7d = await engine.compute_adherence_metrics(patient_id, 7)
+    metrics_30d = await engine.compute_adherence_metrics(patient_id, 30)
+    requested_metrics = await engine.compute_adherence_metrics(patient_id, days)
 
     # Streak calculation — walk backwards day by day
     streak_current, streak_best = await _compute_streaks(db, patient_id, meds)
 
     return AdherenceScoreResponse(
         patient_id=patient_id,
-        score_7d=score_7d,
-        score_30d=score_30d,
-        total_doses_expected=total_expected,
-        total_doses_taken=total_taken,
+        score_7d=metrics_7d.score,
+        score_30d=metrics_30d.score,
+        total_doses_expected=requested_metrics.expected,
+        total_doses_taken=requested_metrics.taken,
         streak_current=streak_current,
         streak_best=streak_best,
     )
@@ -108,7 +82,17 @@ async def _compute_streaks(
     if not meds:
         return 0, 0
 
-    today = datetime.now(timezone.utc).date()
+    patient = (
+        await db.execute(select(Patient).where(Patient.id == patient_id))
+    ).scalar_one_or_none()
+    if patient is None:
+        return 0, 0
+    try:
+        patient_zone = ZoneInfo(patient.timezone_name)
+    except (ZoneInfoNotFoundError, AttributeError):
+        patient_zone = timezone.utc
+
+    today = datetime.now(timezone.utc).astimezone(patient_zone).date()
     total_freq = sum(len(m.frequency) if isinstance(m.frequency, list) else 0 for m in meds)
     if total_freq == 0:
         return 0, 0
@@ -130,8 +114,8 @@ async def _compute_streaks(
             .where(
                 and_(
                     AdherenceLog.patient_id == patient_id,
-                    AdherenceLog.created_at >= day_start,
-                    AdherenceLog.created_at < day_end,
+                    AdherenceLog.call_time >= day_start,
+                    AdherenceLog.call_time < day_end,
                     AdherenceLog.outcome == AdherenceResponseEnum.TAKEN,
                 )
             )
@@ -185,12 +169,22 @@ async def get_adherence_history(
         .where(
             and_(
                 AdherenceLog.patient_id == patient_id,
-                AdherenceLog.created_at >= since,
+                AdherenceLog.call_time >= since,
             )
         )
         .order_by(AdherenceLog.created_at.desc())
     )
     if medication_id:
+        medication_exists = (
+            await db.execute(
+                select(Medication.id).where(
+                    Medication.id == medication_id,
+                    Medication.patient_id == patient_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if medication_exists is None:
+            raise HTTPException(status_code=404, detail="Medication not found")
         stmt = stmt.where(AdherenceLog.medication_id == medication_id)
 
     logs = (await db.execute(stmt)).scalars().all()
@@ -221,12 +215,21 @@ async def get_daily_adherence(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        patient_zone = ZoneInfo(patient.timezone_name)
+    except (ZoneInfoNotFoundError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="Patient timezone is invalid") from exc
+    local_today = datetime.now(timezone.utc).astimezone(patient_zone).date()
+    today_start = datetime.combine(local_today, datetime.min.time(), tzinfo=patient_zone).astimezone(
+        timezone.utc
+    )
+    today_end = today_start + timedelta(days=1)
 
     logs_q = select(AdherenceLog).where(
         and_(
             AdherenceLog.patient_id == patient_id,
-            AdherenceLog.created_at >= today_start,
+            AdherenceLog.call_time >= today_start,
+            AdherenceLog.call_time < today_end,
         )
     )
     today_logs = (await db.execute(logs_q)).scalars().all()
@@ -270,7 +273,7 @@ async def get_daily_adherence(
 
     return DailyAdherenceResponse(
         patient_name=patient.name,
-        date=datetime.now(timezone.utc).date(),
+        date=local_today,
         medications=items,
     )
 
@@ -307,12 +310,18 @@ async def get_adherence_trend(
 
     total_freq = sum(len(m.frequency) if isinstance(m.frequency, list) else 0 for m in meds)
 
-    today = datetime.now(timezone.utc).date()
+    try:
+        patient_zone = ZoneInfo(patient.timezone_name)
+    except (ZoneInfoNotFoundError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="Patient timezone is invalid") from exc
+    today = datetime.now(timezone.utc).astimezone(patient_zone).date()
     points: list[TrendPoint] = []
 
     for offset in range(days - 1, -1, -1):  # oldest first
         d = today - timedelta(days=offset)
-        day_start = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+        day_start = datetime.combine(d, datetime.min.time(), tzinfo=patient_zone).astimezone(
+            timezone.utc
+        )
         day_end = day_start + timedelta(days=1)
 
         taken_q = (
@@ -321,15 +330,15 @@ async def get_adherence_trend(
             .where(
                 and_(
                     AdherenceLog.patient_id == patient_id,
-                    AdherenceLog.created_at >= day_start,
-                    AdherenceLog.created_at < day_end,
+                    AdherenceLog.call_time >= day_start,
+                    AdherenceLog.call_time < day_end,
                     AdherenceLog.outcome == AdherenceResponseEnum.TAKEN,
                 )
             )
         )
         taken = (await db.execute(taken_q)).scalar() or 0
         expected = total_freq
-        score = round((taken / expected) * 100, 1) if expected > 0 else 0.0
+        score = round((taken / expected) * 100, 1) if expected > 0 else None
 
         points.append(
             TrendPoint(date=d, score=score, doses_taken=taken, doses_expected=expected)

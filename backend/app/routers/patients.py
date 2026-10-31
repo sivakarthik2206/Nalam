@@ -4,6 +4,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, select
@@ -16,6 +17,7 @@ from app.models import (
     AdherenceResponseEnum,
     Alert,
     CallSchedule,
+    ConsentStatusEnum,
     Medication,
     Patient,
     TimeSlotEnum,
@@ -175,6 +177,18 @@ async def update_patient(
     for key, value in update_data.items():
         setattr(patient, key, value)
 
+    if payload.consent_status == ConsentStatusEnum.granted and payload.consent_at is None:
+        patient.consent_at = datetime.now(timezone.utc)
+    elif payload.consent_status == ConsentStatusEnum.withdrawn:
+        patient.consent_at = None
+        schedules = (
+            await db.execute(
+                select(CallSchedule).where(CallSchedule.patient_id == patient_id)
+            )
+        ).scalars().all()
+        for schedule in schedules:
+            schedule.is_active = False
+
     await db.flush()
     await db.refresh(patient)
     logger.info("Patient updated id=%s fields=%s", patient_id, list(update_data.keys()))
@@ -232,8 +246,12 @@ async def add_medication(
     await db.flush()
     await db.refresh(med)
 
-    # Auto-create CallSchedule entries
-    now_ist = datetime.now(IST)
+    # Auto-create CallSchedule entries in the patient's timezone and persist UTC.
+    try:
+        patient_zone = ZoneInfo(patient.timezone_name)
+    except (ZoneInfoNotFoundError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="Patient timezone is invalid") from exc
+    now_local = datetime.now(patient_zone)
     for slot_str in payload.frequency:
         hour_min = _SLOT_SCHEDULE.get(slot_str)
         if not hour_min:
@@ -243,8 +261,8 @@ async def add_medication(
         hour, minute = hour_min
 
         # Determine next_call_at
-        today_slot = now_ist.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if now_ist < today_slot:
+        today_slot = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now_local < today_slot:
             next_call = today_slot.astimezone(timezone.utc)
         else:
             next_call = (today_slot + timedelta(days=1)).astimezone(timezone.utc)
@@ -253,6 +271,17 @@ async def add_medication(
             slot_enum = TimeSlotEnum(slot_str)
         except ValueError:
             slot_enum = None
+
+        schedule_exists = (
+            await db.execute(
+                select(CallSchedule).where(
+                    CallSchedule.medication_id == med.id,
+                    CallSchedule.time_slot == slot_enum,
+                )
+            )
+        ).scalar_one_or_none()
+        if schedule_exists:
+            continue
 
         schedule = CallSchedule(
             patient_id=patient_id,
@@ -323,6 +352,19 @@ async def update_medication(
 
     for key, value in update_data.items():
         setattr(med, key, value)
+
+    if "frequency" in update_data:
+        # Preserve historical dose records while keeping future call schedules
+        # aligned with the current prescription.
+        existing_schedules = (
+            await db.execute(
+                select(CallSchedule).where(CallSchedule.medication_id == medication_id)
+            )
+        ).scalars().all()
+        desired_slots = set(update_data["frequency"])
+        for schedule in existing_schedules:
+            if schedule.time_slot is not None and schedule.time_slot.value not in desired_slots:
+                schedule.is_active = False
 
     await db.flush()
     await db.refresh(med)

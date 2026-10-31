@@ -8,7 +8,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import confetti from "canvas-confetti";
 import api from "@/lib/api";
-import { useTriggerCall } from "@/lib/queries";
+import { ManualCallResponse } from "@/lib/types";
 import {
   Card,
   CardHeader,
@@ -37,12 +37,12 @@ import {
   Pill,
   Plus,
   ShieldCheck,
-  Sparkles,
   Trash2,
   User,
   Clock,
   PhoneCall,
 } from "lucide-react";
+import { getApiErrorMessage } from "@/lib/utils";
 
 // ============================================================================
 // Types & Schemas
@@ -250,9 +250,8 @@ export default function OnboardPage() {
           origin: { y: 0.6 },
         });
       } catch {}
-    } catch (err: any) {
-      console.error(err);
-      alert(err?.response?.data?.detail || "Failed to onboard patient");
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err));
     } finally {
       setIsSubmitting(false);
     }
@@ -262,10 +261,14 @@ export default function OnboardPage() {
   const handleTriggerTestCall = async () => {
     if (!createdPatientId) return;
     try {
-      await api.post(`/dashboard/trigger-call/${createdPatientId}`);
-      setCallTriggered(true);
-    } catch (err: any) {
-      alert("Could not connect to Bolna API: " + (err?.response?.data?.detail || err.message));
+      const { data } = await api.post<ManualCallResponse>(`/dashboard/trigger-call/${createdPatientId}`);
+      if (data.calls_triggered > 0) {
+        setCallTriggered(true);
+      } else {
+        alert("The backend did not accept a call. Check Bolna configuration before retrying.");
+      }
+    } catch (err: unknown) {
+      alert(`Could not connect to Bolna API: ${getApiErrorMessage(err)}`);
     }
   };
 
@@ -624,7 +627,7 @@ export default function OnboardPage() {
                       <button
                         key={m.id}
                         type="button"
-                        onClick={() => setCurrentMealRelation(m.id as any)}
+                        onClick={() => setCurrentMealRelation(m.id as "before_meal" | "after_meal" | "with_meal" | "no_relation")}
                         className={`p-2.5 rounded-xl border text-xs font-semibold text-center transition-all ${
                           currentMealRelation === m.id
                             ? "bg-emerald-50 border-emerald-500 text-emerald-900 font-bold"

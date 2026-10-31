@@ -1,220 +1,166 @@
-# Nalam (நலம்) — Voice-First Medication Adherence Platform
+# Nalam (நலம்)
 
-> **Nalam** (நலம் — Tamil for *Wellbeing/Good Health*) is an empathetic, voice-first medication adherence and chronic disease care platform tailored specifically for elderly patients and families across India. Powered by conversational AI voice calls in local languages (Hindi, Tamil, English) and proactive WhatsApp caregiver alerts.
+Nalam is a voice-first medication-adherence monitoring demo for elderly patients. A configured Tamil Bolna agent calls a consented test patient, records a structured medication outcome in FastAPI, calculates adherence from stored logs, and creates family/pharmacy alerts. The Next.js dashboard reads the backend as its source of truth.
 
----
+This checkout is a buildathon/demo system. It must use synthetic records and sandbox/test recipients only. It is not a medical device, does not diagnose, and must not be used with real patient data until authentication, tenant isolation, webhook authentication, retention controls, and regulatory review are complete.
 
-## 🌟 The Problem
-In India, over **77 million people live with Type 2 Diabetes** and another **80+ million battle Hypertension**. For elderly parents living independently:
-- **Language & Literacy Barriers:** Complex English smartphone health apps fail for non-English speaking elderly parents.
-- **Cognitive Load & Polypharmacy:** Elderly seniors take 4–8 pills daily at different times (before meals, after meals). Forgetting doses is rampant.
-- **Caregiver Anxiety & Separation:** Adult children working in metropolitan cities or abroad experience persistent anxiety over whether their parents took vital heart or BP medicines on time.
-- **Unnoticed Side Effects & Refill Stockouts:** Dizziness or nausea often goes unreported until an emergency hospital admission occurs.
+## Architecture
 
----
-
-## 💡 The Solution: The Closed-Loop Care System
-
-```
-                      ┌────────────────────────────────┐
-                      │   Local Pharmacy / Hospital    │
-                      │       Nalam Admin Portal       │
-                      └───────────────┬────────────────┘
-                                      │ (1) Prescribes & Schedules
-                                      ▼
-                      ┌────────────────────────────────┐
-                      │      Nalam FastAPI Engine      │
-                      │   (APScheduler + PostgreSQL)   │
-                      └───────────────┬────────────────┘
-                                      │ (2) Triggers Scheduled Call
-                                      ▼
-                      ┌────────────────────────────────┐
-                      │    Bolna Conversational AI     │
-                      │  (Warm Hindi / Tamil / English)│
-                      └───────────────┬────────────────┘
-                                      │ (3) 90-sec Empathetic Call
-                                      ▼
-                      ┌────────────────────────────────┐
-                      │        Elderly Patient         │
-                      │   (Answers landline / mobile)  │
-                      └───────────────┬────────────────┘
-                                      │ (4) In-call voice response
-                                      ▼
-                      ┌────────────────────────────────┐
-                      │   Instant Webhook Evaluation   │
-                      └───────┬────────────────┬───────┘
-            Taken / Praise    │                │ Missed / Side Effect / Low Refill
-                              ▼                ▼
-     ┌──────────────────────────────┐    ┌───────────────────────────────────┐
-     │  Live Real-time Dashboard    │    │      Twilio WhatsApp Alert        │
-     │   (WebSocket Event Stream)   │    │  (Sent to Son / Daughter instantly│
-     │      Adherence Score ++      │    │  with 1-click WhatsApp Call link) │
-     └──────────────────────────────┘    └───────────────────────────────────┘
+```text
+Next.js (Vercel) ──HTTP/WebSocket──> FastAPI (Railway/Render)
+                                      │
+                                      ├── SQLAlchemy async ──> PostgreSQL
+                                      ├── Bolna outbound call
+                                      │      └── POST /api/v1/log-response
+                                      └── Twilio WhatsApp Sandbox
 ```
 
-1. **Warm Human-like Check-ins:** The system places a friendly call in natural Hindi ("Maata ji") or Tamil ("Amma") asking if the morning/evening dose was taken relative to food.
-2. **Real-time In-Call Feedback:** Powered by Bolna tool calling, patient confirmations, rescheduled doses, or side effects are processed within milliseconds.
-3. **Peace of Mind for Children:** If a dose is missed or dizziness is reported, the caregiver receives an immediate WhatsApp notification with full context.
-4. **Pharmacy Refill Management:** Tracks remaining pills automatically and alerts both pharmacy and family 5 days before stock runs out.
+The intended workflow is:
 
----
+1. An operator selects an explicitly seeded demo patient in `/admin`.
+2. FastAPI loads the patient and medication context and asks Bolna to call the configured test number.
+3. The Tamil conversation confirms identity, asks about the configured medicine and meal timing, checks side effects, and calls `report_adherence` once.
+4. FastAPI validates/normalizes the outcome, stores an `AdherenceLog`, evaluates alerts, and schedules a follow-up for a missed or unanswered outcome.
+5. The dashboard refreshes through polling/WebSocket invalidation and displays the persisted result.
 
-## 🛠️ Tech Stack
+The backend currently uses an in-process APScheduler. It has restart recovery logic, but pending work is not yet a fully durable database-backed queue; run one web worker until that limitation is removed.
 
-### Backend
-- **Framework:** Python 3.12, FastAPI, Uvicorn
-- **ORM & DB:** SQLAlchemy 2.0 (Async), PostgreSQL, asyncpg driver
-- **Migrations:** Alembic
-- **Task Scheduling:** APScheduler (Timezone-aware: `Asia/Kolkata` IST)
-- **Voice Agent:** [Bolna AI](https://bolna.ai) Voice Agents (Hindi, Tamil, English prompts)
-- **Messaging:** Twilio WhatsApp Business API
-- **Real-Time:** WebSockets for instant dashboard event streaming
+## Repository layout
 
-### Frontend
-- **Framework:** Next.js 16.4.1 (App Router), TypeScript
-- **Styling:** Tailwind CSS v4, Lucide React icons
-- **UI Components:** Radix UI / shadcn/ui primitives (cards, dialogs, sheets, badges, tabs)
-- **State & Data Fetching:** TanStack React Query v5, Axios
-- **Data Visualisations:** Recharts (30-day adherence trend lines, 7-day adherence bars)
-- **Delight:** Canvas Confetti for patient onboarding success
+- `backend/app/`: FastAPI application, SQLAlchemy models, routers, adherence, scheduler, Bolna, and Twilio services.
+- `backend/tests/`: pytest contract and regression tests; provider calls are mocked or omitted.
+- `backend/scripts/seed_demo.py`: idempotent synthetic demo seed.
+- `frontend/`: Next.js family and admin views.
+- `bolna-agents/tamil-agent-prompt.md`: Tamil conversation/tool contract to configure in Bolna.
+- `.github/workflows/lint.yml`: backend tests, frontend lint/type/build checks, and high-confidence secret scanning.
 
----
+## Configuration
 
-## 📁 Repository Structure
+Copy `backend/.env.example` to `backend/.env`. The backend reads these variables:
 
-```
-Nalam/
-├── backend/
-│   ├── alembic/                  # Database migration scripts
-│   ├── alembic.ini               # Alembic configuration
-│   ├── app/
-│   │   ├── config.py             # Pydantic v2 application settings
-│   │   ├── database.py           # Async SQLAlchemy session engine
-│   │   ├── main.py               # FastAPI app, lifespan, WebSockets, Demo endpoint
-│   │   ├── middleware.py         # Exception handling & request logging middleware
-│   │   ├── models.py             # SQLAlchemy models (Patient, Medication, AdherenceLog, Alert)
-│   │   ├── schemas.py            # Pydantic validation schemas
-│   │   ├── routers/
-│   │   │   ├── adherence.py      # Adherence history, metrics, manual logging
-│   │   │   ├── dashboard.py      # Pharmacy overview stats, alerts, refill lists
-│   │   │   ├── patients.py       # Patient & medication CRUD, instant trigger calls
-│   │   │   └── webhooks.py       # Bolna in-call function & post-call status webhooks
-│   │   ├── services/
-│   │   │   ├── adherence_engine.py  # Calculates streaks, 7d/30d scores, refill deduction
-│   │   │   ├── bolna_service.py     # Bolna API client for voice triggers
-│   │   │   ├── scheduler_service.py # APScheduler runner for automated call slots
-│   │   │   └── twilio_service.py    # WhatsApp caregiver alert delivery
-│   │   └── utils/
-│   │       └── language.py       # Indian language mapping helpers
-│   ├── seed.py                   # Demo database seeder
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── admin/            # Pharmacy staff dashboard, patients, alerts, refills
-│   │   │   ├── family/[patientId]/ # Shareable non-clinical caregiver status page
-│   │   │   ├── onboard/          # Multi-step patient onboarding with instant test call
-│   │   │   └── page.tsx          # Public landing page
-│   │   ├── components/           # Reusable UI & dashboard components
-│   │   ├── lib/                  # API client, React Query hooks, types, WebSocket helper
-│   │   └── providers/            # React Query & Toast providers
-│   ├── package.json
-│   └── vercel.json
-├── bolna-agents/
-│   ├── hindi-agent-prompt.md     # Production Bolna prompt for Hindi/Hinglish calls
-│   ├── tamil-agent-prompt.md     # Production Bolna prompt for Tamil/Tanglish calls
-│   └── english-agent-prompt.md   # Production Bolna prompt for Indian English calls
-├── .github/workflows/lint.yml    # CI test and build workflow
-├── docker-compose.yml            # Local PostgreSQL + Backend orchestration
-├── Procfile                      # Railway deployment configuration
-├── railway.toml                  # Nixpacks deployment configuration
-└── README.md
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL async URL, for example `postgresql+asyncpg://...` |
+| `SUPABASE_DATABASE_URL` | Optional database override; when non-empty it takes precedence |
+| `BOLNA_API_KEY` | Server-only Bolna credential |
+| `BOLNA_AGENT_ID_TAMIL` | Tamil Bolna agent identifier |
+| `BOLNA_WEBHOOK_SECRET` | Shared secret used to authenticate Bolna callback bodies |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | Server-only Twilio credentials |
+| `TWILIO_WHATSAPP_FROM` | Joined WhatsApp Sandbox sender, normally `whatsapp:+14155238886` |
+| `BACKEND_PUBLIC_URL` | Public HTTPS backend URL used in provider setup |
+| `APP_BASE_URL` | Frontend URL used in dashboard links |
+| `CORS_ORIGINS` | Comma-separated browser origins; do not use `*` for deployment |
+| `DEMO_FAMILY_WHATSAPP` | Optional configured test recipient used by the seed script |
+| `DEMO_RETRY_DELAY_SECONDS` | Optional local retry delay override; leave blank for 30 minutes and never set it in production |
+
+The frontend uses only public browser variables in `frontend/.env.local`:
+
+```dotenv
+NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+NEXT_PUBLIC_WS_URL=ws://localhost:8000/api/v1/ws/dashboard
 ```
 
----
+The scheduler currently reads `DEMO_RETRY_DELAY_SECONDS` directly from the process environment; it does not yet require an explicit `DEMO_MODE=true` guard. Leave it blank outside local demos. The repository still contains legacy Hindi/English and Sarvam references in `bolna-agents/bolna_agent_config.json`; that file must not be imported as the Tamil production configuration.
 
-## 🚀 Quickstart & Local Setup
+## Local setup
 
-### Prerequisites
-- Python 3.12+
-- Node.js 20+ & pnpm
-- Docker & Docker Compose (or a local PostgreSQL 16 instance)
+Prerequisites: Python 3.12+, PostgreSQL 16+, Node.js 20+, and pnpm 10.
 
-### 1. Clone & Configure Environment
-
-Create your `.env` file in the root:
-```bash
-cp .env.example .env
-```
-
-Populate your API keys:
-- `BOLNA_API_KEY`: Get from [Bolna Dashboard](https://bolna.ai)
-- `BOLNA_AGENT_ID_HINDI`: Agent ID for Hindi calls
-- `BOLNA_AGENT_ID_TAMIL`: Agent ID for Tamil calls
-- `TWILIO_ACCOUNT_SID`: Twilio account SID
-- `TWILIO_AUTH_TOKEN`: Twilio auth token
-- `TWILIO_WHATSAPP_FROM`: WhatsApp sender (e.g. `whatsapp:+14155238886`)
-
-### 2. Run Database & Backend
-
-Using Docker Compose:
-```bash
+```powershell
 docker compose up -d db
-```
 
-Or run FastAPI directly:
-```bash
 cd backend
-python -m venv venv
-# Windows:
-venv\Scripts\activate
-# Linux/macOS:
-source venv/bin/activate
-
-pip install -r requirements.txt
-python seed.py
-uvicorn app.main:app --reload --port 8000
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install pytest pytest-asyncio aiosqlite
+Copy-Item .env.example .env
 ```
-Backend Swagger API documentation will be available at [http://localhost:8000/docs](http://localhost:8000/docs).
 
-### 3. Run Frontend
+The current Alembic head includes an empty-database path and an additive durable-domain migration, but it was not executable in this environment because Docker/PostgreSQL was unavailable. Verify `alembic upgrade head` against a fresh PostgreSQL database before deployment. The demo seed also calls SQLAlchemy `create_all` for local convenience; that is not a substitute for production migrations.
 
-In a separate terminal:
-```bash
+For a local demo database only:
+
+```powershell
+python -m scripts.seed_demo
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+In another terminal:
+
+```powershell
 cd frontend
-pnpm install
+pnpm install --frozen-lockfile
+Copy-Item ..\.env.example .env.local
 pnpm dev
 ```
-Open [http://localhost:3000](http://localhost:3000) in your browser.
 
----
+Open `http://localhost:3000/admin`. The seed script is intended to be idempotent by patient phone and medication name, but it only contains synthetic records.
 
-## ⚡ Live Hackathon Demo Features
+## Provider setup
 
-1. **One-Click Instant Judge Demo Call:**
-   - Make a `POST` request to `/api/v1/test/trigger-demo` with your personal phone number, language (`"hindi"`, `"tamil"`, or `"english"`), and medication name.
-   - Within 5 seconds, your phone will ring with Nalam calling in your chosen language!
-2. **Interactive Onboarding (`/onboard`):**
-   - Clean 4-step wizard: Patient Info $\rightarrow$ Chronic Medications $\rightarrow$ Call Timing & Food Relations $\rightarrow$ Instant Test Call.
-   - Confetti celebration upon completion with a one-click copyable Family Dashboard link.
-3. **Shareable Family Link (`/family/{patientId}`):**
-   - Clean, loving, zero-jargon dashboard designed for family members.
-   - Displays 7-day adherence bars, today's medication timeline, and an emergency "Call Parent" button.
-4. **Staff Admin Operations (`/admin`):**
-   - Real-time KPI counter (Active Patients, Today's Adherence Rate, Critical Alerts, Pending Refills).
-   - Instant voice call trigger from patient list.
-   - Refill inventory depletion tracking based on adherence logs.
+### Bolna
 
----
+Deploy the backend at a public HTTPS URL before configuring Bolna. Configure one Tamil agent with Bolna's bundled ASR/LLM/TTS, the prompt in `bolna-agents/tamil-agent-prompt.md`, and the `report_adherence` tool URL:
 
-## 🛡️ Safety & Medical Disclaimers
-- Nalam is an adherence companion and never modifies prescriptions or provides medical diagnoses.
-- In-call safety guardrails immediately instruct patients reporting severe distress (chest pain, acute breathlessness) to contact emergency services (108 in India) and instantly flags emergency alerts to registered family members.
+```text
+https://<backend-host>/api/v1/log-response
+```
 
----
+The post-call endpoint is:
 
-## 👨‍💻 Author & Buildathon Credit
-- **Built by:** Siva Karthik
-- **Institution:** Vellore Institute of Technology (VIT), Chennai
-- **Theme:** AI Voice & Healthcare for Bharat
+```text
+https://<backend-host>/api/v1/webhooks/bolna
+```
+
+The callback endpoints require `BOLNA_WEBHOOK_SECRET` and an HMAC/static-secret header. Configure the provider's exact supported signature header before exposing them publicly. A configured `BOLNA_API_KEY` or agent ID is not evidence that a real call was completed.
+
+### Twilio WhatsApp Sandbox
+
+Configure the account SID, auth token, sender, and a family/test recipient that has joined the sandbox. The current service reports provider request results but does not persist a complete delivery state machine or verify delivery callbacks. Automated tests never send real messages.
+
+## Commands and verification
+
+Backend:
+
+```powershell
+cd backend
+pytest -q
+python -m compileall -q app scripts
+```
+
+Frontend:
+
+```powershell
+cd frontend
+pnpm lint
+pnpm exec tsc --noEmit
+pnpm build
+```
+
+Important endpoints include `GET /health`, `GET /`, `GET /api/v1/dashboard/admin`, `GET /api/v1/dashboard/family/{patient_id}`, `POST /api/v1/dashboard/trigger-call/{patient_id}`, `POST /api/v1/log-response`, and `POST /api/v1/webhooks/bolna/function`.
+
+The tests prove local contracts using SQLite and provider mocks. They do not prove a live Bolna call, a live Twilio delivery, a public deployment, or a PostgreSQL migration run.
+
+## Deployment
+
+### Backend
+
+`Procfile` and `railway.toml` start one Uvicorn worker and run `alembic upgrade head` before startup. Provide PostgreSQL, `DATABASE_URL`, the server-only provider credentials, `BACKEND_PUBLIC_URL`, `APP_BASE_URL`, and an explicit `CORS_ORIGINS`. Verify `/health` and database readiness after deployment. Because the scheduler is in-process, do not scale the web process horizontally.
+
+### Frontend
+
+Create a Vercel project with root directory `frontend`, use the Next.js preset, and set `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` to the deployed backend. Never put database, Bolna, Twilio, or webhook credentials in Vercel variables.
+
+## Demo sequence
+
+1. Start PostgreSQL, seed the synthetic data, and start FastAPI and Next.js.
+2. Open `/admin` and select a seeded patient.
+3. Use the manual call control only after configuring a real Bolna agent and test recipient.
+4. For a local contract-only demo, submit a structured payload to `/api/v1/log-response` with the seeded patient and medication UUIDs; inspect the family/admin dashboards afterward.
+5. For a missed-dose path, submit `outcome=MISSED`; inspect the persisted retry scheduling/log output. The production default is 30 minutes. For a local-only accelerated run, set `DEMO_RETRY_DELAY_SECONDS=120` before starting the backend and clear it afterward.
+6. Treat any WhatsApp alert as unverified until it is observed in the joined sandbox; no local test simulates provider delivery.
+
+## Security status
+
+No committed high-confidence API credentials were found in the tracked files reviewed for this QA pass. `.env.example` files contain blanks/placeholders, and CI scans tracked files for common credential patterns. That does not make the application safe for public health data: authentication/authorization, tenant isolation, webhook signature validation, rate limiting, strict demo-recipient enforcement, durable idempotency across webhook side effects, and secret rotation remain required before production use.

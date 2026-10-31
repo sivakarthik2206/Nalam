@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
@@ -21,6 +20,7 @@ from app.models import (
     AdherenceLog,
     Alert,
     CallSchedule,
+    ConsentStatusEnum,
     Medication,
     Patient,
 )
@@ -75,8 +75,8 @@ class TriggerCallsResponse(BaseModel):
     summary="[Spec alias] Trigger calls for patients",
 )
 async def trigger_calls(
-    body: TriggerCallsRequest = TriggerCallsRequest(),
-    request: Request = None,
+    request: Request,
+    body: TriggerCallsRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -86,6 +86,8 @@ async def trigger_calls(
     - force=False: only trigger for patients whose CallSchedule.next_call_at <= now.
     - force=True: trigger for ALL specified/active patients regardless of schedule.
     """
+    if body is None:
+        body = TriggerCallsRequest()
     bolna = request.app.state.bolna_service
     now = datetime.now(timezone.utc)
 
@@ -101,10 +103,21 @@ async def trigger_calls(
                 failed=[{"patient_id": str(body.patient_ids), "error": str(e)}]
             )
         patients_q = select(Patient).where(
-            and_(Patient.id.in_(patient_uuids), Patient.is_active.is_(True))
+            and_(
+                Patient.id.in_(patient_uuids),
+                Patient.is_active.is_(True),
+                Patient.demo_only.is_(True),
+                Patient.consent_status == ConsentStatusEnum.granted,
+            )
         )
     else:
-        patients_q = select(Patient).where(Patient.is_active.is_(True))
+        patients_q = select(Patient).where(
+            and_(
+                Patient.is_active.is_(True),
+                Patient.demo_only.is_(True),
+                Patient.consent_status == ConsentStatusEnum.granted,
+            )
+        )
 
     patients = (await db.execute(patients_q)).scalars().all()
 
@@ -165,7 +178,7 @@ async def trigger_calls(
 
         except Exception as exc:
             logger.exception("trigger-calls failed for patient %s", patient.id)
-            failed.append({"patient_id": str(patient.id), "error": str(exc)})
+            failed.append({"patient_id": str(patient.id), "error": "call_trigger_failed"})
 
     return TriggerCallsResponse(triggered=triggered, failed=failed)
 
@@ -192,7 +205,7 @@ async def patient_summary(
     engine = AdherenceEngine(db)
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    async def _build_summary(patient: Patient) -> dict[str, Any]:
+    async def _build_summary(patient: Patient) -> dict[str, object]:
         score_7d = await engine.compute_adherence_score(patient.id, 7)
 
         # Today's call status
@@ -217,7 +230,7 @@ async def patient_summary(
         meds = (await db.execute(meds_q)).scalars().all()
 
         # Last confirmed time per medication
-        med_list: list[dict[str, Any]] = []
+        med_list: list[dict[str, object]] = []
         for med in meds:
             last_taken_q = (
                 select(AdherenceLog)
@@ -307,8 +320,8 @@ async def patient_summary(
     summary="[Spec alias] Trigger WhatsApp daily summary",
 )
 async def daily_summary(
+    request: Request,
     patient_id: uuid.UUID | None = Query(None, description="Omit for all active patients"),
-    request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
     """

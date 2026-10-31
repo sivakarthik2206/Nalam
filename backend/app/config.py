@@ -1,4 +1,3 @@
-from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,23 +14,25 @@ class Settings(BaseSettings):
 
     # Bolna AI
     BOLNA_API_KEY: str = ""
-    BOLNA_AGENT_ID_HINDI: str = ""
     BOLNA_AGENT_ID_TAMIL: str = ""
-    BOLNA_AGENT_ID_ENGLISH: str = ""
+    BOLNA_WEBHOOK_SECRET: str = ""
 
     # Twilio
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_WHATSAPP_FROM: str = "whatsapp:+14155238886"
 
-    # Sarvam AI
-    SARVAM_API_KEY: str = ""
-
     # App
+    APP_ENV: str = "development"
     APP_BASE_URL: str = ""
     BACKEND_PUBLIC_URL: str = ""
-    CORS_ORIGINS: str = "*"
+    FRONTEND_ORIGIN: str = ""
+    CORS_ORIGINS: str = "http://localhost:3000"
     DEMO_FAMILY_WHATSAPP: str = ""
+    DEMO_MODE: bool = False
+    DEMO_RETRY_DELAY_SECONDS: int = 1800
+    DEFAULT_TIMEZONE: str = "Asia/Kolkata"
+    LOG_LEVEL: str = "INFO"
 
     @property
     def effective_database_url(self) -> str:

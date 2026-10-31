@@ -58,7 +58,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { toast } from "@/components/ui/toast";
-import { getAdherenceColor, formatDate, formatTime } from "@/lib/utils";
+import { getAdherenceColor, formatDate, formatTime, getApiErrorMessage } from "@/lib/utils";
 
 export default function PatientDetailPage() {
   const params = useParams();
@@ -83,18 +83,27 @@ export default function PatientDetailPage() {
 
   const handleTriggerCall = () => {
     triggerCall.mutate(undefined, {
-      onSuccess: () => {
-        (toast as any).add({
-          type: "success",
-          title: "Voice Call Initiated",
-          description: `Bolna AI is calling ${patient?.name || "the patient"} at ${patient?.phone}...`,
+      onSuccess: (result) => {
+        if (result.calls_triggered > 0) {
+          toast.add({
+            type: "success",
+            title: "Voice Call Initiated",
+            description: `The backend accepted a call for ${patient?.name || "the patient"}.`,
+          });
+          return;
+        }
+
+        toast.add({
+          type: "error",
+          title: "Call Not Initiated",
+          description: "The backend did not accept a call. Check Bolna configuration before retrying.",
         });
       },
-      onError: (err: any) => {
-        (toast as any).add({
+      onError: (err: unknown) => {
+        toast.add({
           type: "error",
           title: "Call Failed",
-          description: err?.response?.data?.detail || "Could not connect to Bolna API",
+          description: getApiErrorMessage(err),
         });
       },
     });
@@ -109,7 +118,7 @@ export default function PatientDetailPage() {
       navigator.clipboard.writeText(url);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-      (toast as any).add({
+      toast.add({
         type: "success",
         title: "Family Link Copied",
         description: "The public family view URL has been copied to your clipboard.",

@@ -1,36 +1,72 @@
-"""APScheduler-based service that orchestrates medication reminder calls,
-follow-ups, and daily summary delivery."""
+"""Durable database-backed scheduling for Nalam calls and follow-ups.
+
+APScheduler is used only as an execution timer. The adherence log remains the
+source of truth for pending retries, so a process restart can reconstruct jobs.
+"""
+
+from __future__ import annotations
 
 import logging
+import os
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models import (
-    AdherenceLog,
-    CallSchedule,
-    Medication,
-    Patient,
-)
+from app.alerts import send_daily_summary, send_no_answer_alert
+from app.config import settings
+from app.models import AdherenceLog, CallSchedule, Medication, Patient
 from app.services.adherence_engine import AdherenceEngine
 from app.services.bolna_service import BolnaService
 from app.services.twilio_service import TwilioService
-from app.config import settings
-from app.utils.language import get_bolna_agent_id
 
 logger = logging.getLogger(__name__)
 
-IST = timezone(timedelta(hours=5, minutes=30))
-
-# Max retry attempts before escalating to family alert
 _MAX_RETRY_ATTEMPTS = 2
+_DEFAULT_RETRY_DELAY_SECONDS = 30 * 60
+_RETRY_RECOVERY_WINDOW = timedelta(hours=2)
+
+
+def _retry_delay() -> timedelta:
+    raw_value = os.getenv("DEMO_RETRY_DELAY_SECONDS", "")
+    if not raw_value:
+        return timedelta(seconds=_DEFAULT_RETRY_DELAY_SECONDS)
+    try:
+        seconds = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid DEMO_RETRY_DELAY_SECONDS; using 1800 seconds")
+        return timedelta(seconds=_DEFAULT_RETRY_DELAY_SECONDS)
+    if seconds < 0:
+        logger.warning("Negative DEMO_RETRY_DELAY_SECONDS; using 1800 seconds")
+        return timedelta(seconds=_DEFAULT_RETRY_DELAY_SECONDS)
+    return timedelta(seconds=seconds)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _provider_call_succeeded(result: object) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+    if result.get("error"):
+        return False
+    execution_id = result.get("execution_id") or result.get("call_id")
+    return isinstance(execution_id, str) and bool(execution_id.strip())
+
+
+def _has_call_consent(patient: Patient) -> bool:
+    consent = getattr(patient, "consent_status", None)
+    return consent is not None and getattr(consent, "value", consent) == "granted"
 
 
 class SchedulerService:
-    """Manages recurring jobs: calls, follow-ups, daily summaries."""
+    """Manage daily calls, durable retry timers, and WhatsApp summaries."""
 
     def __init__(
         self,
@@ -43,25 +79,25 @@ class SchedulerService:
         self.twilio = twilio_service
         self._session_factory = db_session_factory
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     async def start(self) -> None:
-        """Register jobs and start the scheduler."""
+        """Register recurring jobs and reconstruct persisted retry work."""
         self.scheduler.add_job(
             self.check_and_trigger_calls,
             "interval",
             minutes=5,
             id="check_and_trigger_calls",
             replace_existing=True,
+            max_instances=1,
+            coalesce=True,
         )
         self.scheduler.add_job(
             self.process_follow_ups,
             "interval",
-            minutes=1,  # Reduced to 1 min as safety net
+            minutes=1,
             id="process_follow_ups",
             replace_existing=True,
+            max_instances=1,
+            coalesce=True,
         )
         self.scheduler.add_job(
             self.send_daily_summaries,
@@ -71,26 +107,29 @@ class SchedulerService:
             timezone="Asia/Kolkata",
             id="send_daily_summaries",
             replace_existing=True,
+            max_instances=1,
+            coalesce=True,
         )
         self.scheduler.start()
-
-        # Server-restart recovery: schedule pending retries
-        try:
-            await self._recover_pending_retries()
-        except Exception:
-            logger.exception("Failed to recover pending retries on startup")
-
-        logger.info("SchedulerService started — 3 jobs registered")
+        await self._recover_pending_retries()
+        logger.info("SchedulerService started with durable retry recovery")
 
     async def stop(self) -> None:
-        """Gracefully shut down the scheduler."""
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
             logger.info("SchedulerService stopped")
 
-    # ------------------------------------------------------------------
-    # Retry scheduling (Phase 4)
-    # ------------------------------------------------------------------
+    async def _set_retry_marker(self, log_id: uuid.UUID, scheduled: bool) -> None:
+        try:
+            async with self._session_factory() as db:
+                log = (
+                    await db.execute(select(AdherenceLog).where(AdherenceLog.id == log_id))
+                ).scalar_one_or_none()
+                if log:
+                    log.retry_scheduled = scheduled
+                    await db.commit()
+        except Exception:
+            logger.exception("Could not update retry marker log_id=%s", log_id)
 
     async def schedule_retry_call(
         self,
@@ -98,86 +137,77 @@ class SchedulerService:
         medication_id: str,
         log_id: str,
         attempt_number: int = 1,
+        run_at: datetime | None = None,
     ) -> None:
-        """
-        Schedule an exact 30-minute retry call for a patient/medication.
-
-        Caps at _MAX_RETRY_ATTEMPTS. If cap is hit, fires urgent family WhatsApp alert instead.
-        Uses idempotent job id so duplicate schedules replace each other.
-        """
+        """Reserve and schedule one retry, with persisted restart recovery."""
+        patient_uuid = uuid.UUID(patient_id)
+        medication_uuid = uuid.UUID(medication_id)
+        log_uuid = uuid.UUID(log_id)
         try:
-            # Count existing retry logs for this patient+medication today
             async with self._session_factory() as db:
                 today_start = datetime.now(timezone.utc).replace(
-                    hour=0, minute=0, second=0, microsecond=0
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
                 )
-                retry_count_q = (
-                    select(AdherenceLog)
-                    .where(
-                        and_(
-                            AdherenceLog.patient_id == uuid.UUID(patient_id),
-                            AdherenceLog.medication_id == uuid.UUID(medication_id),
-                            AdherenceLog.follow_up_needed.is_(True),
-                            AdherenceLog.created_at >= today_start,
-                        )
+                retry_count_q = select(AdherenceLog).where(
+                    and_(
+                        AdherenceLog.patient_id == patient_uuid,
+                        AdherenceLog.medication_id == medication_uuid,
+                        AdherenceLog.follow_up_needed.is_(True),
+                        AdherenceLog.created_at >= today_start,
                     )
                 )
                 retry_logs = (await db.execute(retry_count_q)).scalars().all()
-                existing_retry_count = len(retry_logs)
-
-                if existing_retry_count >= _MAX_RETRY_ATTEMPTS:
-                    # Cap hit — fire urgent family alert instead
-                    logger.info(
-                        "Retry cap hit for patient %s med %s — firing urgent no_answer alert",
-                        patient_id, medication_id,
-                    )
+                if len(retry_logs) >= _MAX_RETRY_ATTEMPTS:
                     patient = (
-                        await db.execute(
-                            select(Patient).where(Patient.id == uuid.UUID(patient_id))
-                        )
+                        await db.execute(select(Patient).where(Patient.id == patient_uuid))
                     ).scalar_one_or_none()
                     if patient and patient.family_whatsapp:
-                        try:
-                            from app.alerts import send_no_answer_alert
-                            await send_no_answer_alert(self.twilio, patient)
-                        except Exception:
-                            logger.exception("Failed to send no_answer alert for patient %s", patient_id)
+                        delivered = await send_no_answer_alert(self.twilio, patient)
+                        logger.info(
+                            "Retry cap reached patient=%s alert_delivered=%s",
+                            patient_uuid,
+                            delivered,
+                        )
                     return
 
-                # Mark log as retry_scheduled
                 log_obj = (
-                    await db.execute(
-                        select(AdherenceLog).where(AdherenceLog.id == uuid.UUID(log_id))
-                    )
+                    await db.execute(select(AdherenceLog).where(AdherenceLog.id == log_uuid))
                 ).scalar_one_or_none()
-                if log_obj:
-                    log_obj.retry_scheduled = True
-                    await db.commit()
+                if not log_obj:
+                    logger.error("Cannot schedule retry for missing log_id=%s", log_uuid)
+                    return
+                log_obj.retry_scheduled = True
+                await db.commit()
 
-            # Schedule APScheduler date job
-            run_date = datetime.now(timezone.utc) + timedelta(minutes=30)
-            job_id = f"retry-{patient_id}-{medication_id}-{log_id}"
-
+            due_at = _as_utc(run_at) if run_at else datetime.now(timezone.utc) + _retry_delay()
+            if due_at < datetime.now(timezone.utc):
+                due_at = datetime.now(timezone.utc)
+            job_id = f"retry-{patient_uuid}-{medication_uuid}-{log_uuid}"
             self.scheduler.add_job(
                 self._execute_retry_call,
                 "date",
-                run_date=run_date,
+                run_date=due_at,
                 id=job_id,
                 replace_existing=True,
                 kwargs={
-                    "patient_id": patient_id,
-                    "medication_id": medication_id,
-                    "log_id": log_id,
+                    "patient_id": str(patient_uuid),
+                    "medication_id": str(medication_uuid),
+                    "log_id": str(log_uuid),
                     "attempt_number": attempt_number,
                 },
             )
             logger.info(
-                "Retry call scheduled for patient %s at %s (job_id=%s)",
-                patient_id, run_date.isoformat(), job_id,
+                "Retry reserved patient=%s log_id=%s run_at=%s",
+                patient_uuid,
+                log_uuid,
+                due_at.isoformat(),
             )
-
         except Exception:
-            logger.exception("schedule_retry_call failed for patient %s", patient_id)
+            logger.exception("Retry scheduling failed patient=%s log_id=%s", patient_uuid, log_uuid)
+            await self._set_retry_marker(log_uuid, scheduled=False)
 
     async def _execute_retry_call(
         self,
@@ -186,323 +216,203 @@ class SchedulerService:
         log_id: str,
         attempt_number: int = 1,
     ) -> None:
-        """Job function — executes the actual retry Bolna call."""
+        """Execute a reserved retry; the callback completes the original log."""
+        log_uuid = uuid.UUID(log_id)
         try:
             async with self._session_factory() as db:
                 patient = (
-                    await db.execute(
-                        select(Patient).where(Patient.id == uuid.UUID(patient_id))
-                    )
+                    await db.execute(select(Patient).where(Patient.id == uuid.UUID(patient_id)))
                 ).scalar_one_or_none()
                 medication = (
-                    await db.execute(
-                        select(Medication).where(Medication.id == uuid.UUID(medication_id))
-                    )
+                    await db.execute(select(Medication).where(Medication.id == uuid.UUID(medication_id)))
                 ).scalar_one_or_none()
-
-                if not patient or not patient.is_active:
+                if (
+                    not patient
+                    or not patient.is_active
+                    or not _has_call_consent(patient)
+                    or patient.language.value != "tamil"
+                ):
+                    logger.warning("Retry skipped for inactive or non-Tamil patient=%s", patient_id)
                     return
                 if not medication or not medication.is_active:
+                    logger.warning("Retry skipped for inactive medication=%s", medication_id)
                     return
 
-                agent_id = get_bolna_agent_id(patient.language.value)
+                agent_id = settings.BOLNA_AGENT_ID_TAMIL
                 if not agent_id:
-                    logger.warning("No Bolna agent for patient %s language", patient_id)
+                    logger.error("Retry blocked because BOLNA_AGENT_ID_TAMIL is not configured")
+                    await self._set_retry_marker(log_uuid, scheduled=False)
                     return
-
                 user_data = {
                     "patient_name": patient.name,
                     "medication_name": medication.name,
                     "dosage": medication.dosage,
                     "meal_timing": medication.meal_timing.value,
-                    "language": patient.language.value,
+                    "language": "tamil",
                     "time_slot": "morning",
                     "patient_id": patient_id,
                     "medication_id": medication_id,
                     "is_follow_up": True,
                     "attempt_number": attempt_number,
+                    "retry_log_id": log_id,
                 }
-
-                await self.bolna.trigger_call(
+                result = await self.bolna.trigger_call(
                     agent_id=agent_id,
                     recipient_phone=patient.phone,
                     user_data=user_data,
                 )
-                logger.info("Retry call executed for patient %s (attempt %d)", patient_id, attempt_number)
+                if not _provider_call_succeeded(result):
+                    logger.error("Retry provider did not accept call patient=%s", patient_id)
+                    await self._set_retry_marker(log_uuid, scheduled=False)
+                    return
+                logger.info(
+                    "Retry call accepted patient=%s execution_id=%s attempt=%d",
+                    patient_id,
+                    result.get("execution_id") or result.get("call_id"),
+                    attempt_number,
+                )
         except Exception:
-            logger.exception("_execute_retry_call failed for patient %s", patient_id)
+            logger.exception("Retry execution failed patient=%s", patient_id)
+            await self._set_retry_marker(log_uuid, scheduled=False)
 
     async def _recover_pending_retries(self) -> None:
-        """
-        On server restart, find unretried logs from last 2 hours and re-schedule them.
-        Idempotency: only reschedule logs where retry_scheduled=False.
-        """
+        """Rebuild retry timers from logs after a process restart."""
         try:
+            cutoff = datetime.now(timezone.utc) - _RETRY_RECOVERY_WINDOW
             async with self._session_factory() as db:
-                cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
-                stmt = (
-                    select(AdherenceLog)
-                    .where(
-                        and_(
-                            AdherenceLog.follow_up_needed.is_(True),
-                            AdherenceLog.follow_up_completed.is_(False),
-                            AdherenceLog.retry_scheduled.is_(False),
-                            AdherenceLog.created_at >= cutoff,
-                        )
+                stmt = select(AdherenceLog).where(
+                    and_(
+                        AdherenceLog.follow_up_needed.is_(True),
+                        AdherenceLog.follow_up_completed.is_(False),
+                        AdherenceLog.created_at >= cutoff,
                     )
                 )
-                pending_logs = (await db.execute(stmt)).scalars().all()
-
-                for log in pending_logs:
-                    await self.schedule_retry_call(
-                        patient_id=str(log.patient_id),
-                        medication_id=str(log.medication_id),
-                        log_id=str(log.id),
-                        attempt_number=1,
+                pending = (await db.execute(stmt)).scalars().all()
+                recovery_items = [
+                    (
+                        str(log.patient_id),
+                        str(log.medication_id),
+                        str(log.id),
+                        _as_utc(log.created_at) + _retry_delay(),
                     )
-                logger.info("Recovery: scheduled %d pending retries", len(pending_logs))
+                    for log in pending
+                ]
+            for patient_id, medication_id, log_id, due_at in recovery_items:
+                await self.schedule_retry_call(
+                    patient_id=patient_id,
+                    medication_id=medication_id,
+                    log_id=log_id,
+                    attempt_number=1,
+                    run_at=due_at,
+                )
+            logger.info("Retry recovery reconstructed count=%d", len(recovery_items))
         except Exception:
-            logger.exception("_recover_pending_retries failed")
-
-    # ------------------------------------------------------------------
-    # Job 1 — Check & trigger due calls (every 5 min)
-    # ------------------------------------------------------------------
+            logger.exception("Retry recovery failed")
 
     async def check_and_trigger_calls(self) -> None:
-        """Query CallSchedule for due calls and trigger them via Bolna."""
-        logger.info("check_and_trigger_calls — starting")
+        """Trigger due Tamil schedules and advance them only after acceptance."""
         try:
             async with self._session_factory() as db:
                 now = datetime.now(timezone.utc)
                 today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
                 stmt = select(CallSchedule).where(
                     and_(
                         CallSchedule.is_active.is_(True),
                         CallSchedule.next_call_at <= now,
-                        # Only call once per day
-                        (
-                            (CallSchedule.last_call_at.is_(None))
-                            | (CallSchedule.last_call_at < today_start)
-                        ),
+                        (CallSchedule.last_call_at.is_(None) | (CallSchedule.last_call_at < today_start)),
                     )
                 )
                 schedules = (await db.execute(stmt)).scalars().all()
-
-                if not schedules:
-                    logger.debug("No due call schedules found")
-                    return
-
-                logger.info("Found %d due call schedules", len(schedules))
-
-                for sched in schedules:
-                    try:
-                        # Load patient + medication
-                        patient = (
-                            await db.execute(
-                                select(Patient).where(Patient.id == sched.patient_id)
-                            )
-                        ).scalar_one_or_none()
-                        medication = (
-                            await db.execute(
-                                select(Medication).where(Medication.id == sched.medication_id)
-                            )
-                        ).scalar_one_or_none()
-
-                        if not patient or not patient.is_active:
-                            continue
-                        if not medication or not medication.is_active:
-                            continue
-
-                        agent_id = get_bolna_agent_id(patient.language.value)
-                        if not agent_id:
-                            logger.warning(
-                                "No Bolna agent for language %s (patient %s)",
-                                patient.language.value,
-                                patient.id,
-                            )
-                            continue
-
-                        user_data = {
-                            "patient_name": patient.name,
-                            "medication_name": medication.name,
-                            "dosage": medication.dosage,
-                            "meal_timing": medication.meal_timing.value,
-                            "language": patient.language.value,
-                            "time_slot": sched.time_slot.value if sched.time_slot else "morning",
-                            "patient_id": str(patient.id),
-                            "medication_id": str(medication.id),
-                        }
-
-                        result = await self.bolna.trigger_call(
-                            agent_id=agent_id,
-                            recipient_phone=patient.phone,
-                            user_data=user_data,
-                        )
-                        logger.info(
-                            "Call triggered for patient %s → %s",
-                            patient.name,
-                            result.get("call_id", "no_id"),
-                        )
-
-                        # Advance schedule
-                        sched.last_call_at = now
-                        # Next call tomorrow at the same HH:MM
-                        tomorrow = now + timedelta(days=1)
-                        sched.next_call_at = tomorrow.replace(
-                            hour=sched.scheduled_hour,
-                            minute=sched.scheduled_minute,
-                            second=0,
-                            microsecond=0,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to trigger call for schedule %s", sched.id
-                        )
-
+                for schedule in schedules:
+                    patient = (
+                        await db.execute(select(Patient).where(Patient.id == schedule.patient_id))
+                    ).scalar_one_or_none()
+                    medication = (
+                        await db.execute(select(Medication).where(Medication.id == schedule.medication_id))
+                    ).scalar_one_or_none()
+                    if (
+                        not patient
+                        or not patient.is_active
+                        or not _has_call_consent(patient)
+                        or patient.language.value != "tamil"
+                    ):
+                        continue
+                    if not medication or not medication.is_active:
+                        continue
+                    agent_id = settings.BOLNA_AGENT_ID_TAMIL
+                    if not agent_id:
+                        logger.error("Scheduled call blocked because BOLNA_AGENT_ID_TAMIL is not configured")
+                        continue
+                    user_data = {
+                        "patient_name": patient.name,
+                        "medication_name": medication.name,
+                        "dosage": medication.dosage,
+                        "meal_timing": medication.meal_timing.value,
+                        "language": "tamil",
+                        "time_slot": schedule.time_slot.value if schedule.time_slot else "morning",
+                        "patient_id": str(patient.id),
+                        "medication_id": str(medication.id),
+                    }
+                    result = await self.bolna.trigger_call(
+                        agent_id=agent_id,
+                        recipient_phone=patient.phone,
+                        user_data=user_data,
+                    )
+                    if not _provider_call_succeeded(result):
+                        logger.error("Scheduled call not accepted schedule_id=%s", schedule.id)
+                        continue
+                    schedule.last_call_at = now
+                    next_day = now + timedelta(days=1)
+                    schedule.next_call_at = next_day.replace(
+                        hour=schedule.scheduled_hour,
+                        minute=schedule.scheduled_minute,
+                        second=0,
+                        microsecond=0,
+                    )
                 await db.commit()
         except Exception:
-            logger.exception("check_and_trigger_calls — job failed")
-
-    # ------------------------------------------------------------------
-    # Job 2 — Process follow-ups (every 1 min — safety net)
-    # ------------------------------------------------------------------
+            logger.exception("Scheduled call check failed")
 
     async def process_follow_ups(self) -> None:
-        """Safety-net: re-call patients who said not_taken / callback_requested ≥ 30 min ago
-        and whose retry_scheduled is still False (i.e., exact APScheduler job was missed)."""
-        logger.debug("process_follow_ups — starting")
+        """Convert due unreserved follow-ups into the same durable retry job."""
         try:
             async with self._session_factory() as db:
-                engine = AdherenceEngine(db)
-                pending = await engine.get_follow_up_patients()
-
-                if not pending:
-                    return
-
-                now = datetime.now(timezone.utc)
-                thirty_min_ago = now - timedelta(minutes=30)
-
-                for entry in pending:
-                    try:
-                        # Idempotency: skip if retry already scheduled
-                        if entry.get("retry_scheduled"):
-                            continue
-
-                        created = datetime.fromisoformat(entry["created_at"])
-                        if created > thirty_min_ago:
-                            # Not yet 30 minutes old — skip
-                            continue
-
-                        patient_id = uuid.UUID(entry["patient_id"])
-                        medication_id = uuid.UUID(entry["medication_id"])
-                        log_id = entry["adherence_log_id"]
-
-                        patient = (
-                            await db.execute(
-                                select(Patient).where(Patient.id == patient_id)
-                            )
-                        ).scalar_one_or_none()
-                        medication = (
-                            await db.execute(
-                                select(Medication).where(Medication.id == medication_id)
-                            )
-                        ).scalar_one_or_none()
-
-                        if not patient or not patient.is_active:
-                            continue
-                        if not medication:
-                            continue
-
-                        agent_id = get_bolna_agent_id(patient.language.value)
-                        if not agent_id:
-                            continue
-
-                        user_data = {
-                            "patient_name": patient.name,
-                            "medication_name": medication.name,
-                            "dosage": medication.dosage,
-                            "meal_timing": medication.meal_timing.value,
-                            "language": patient.language.value,
-                            "time_slot": entry.get("time_slot", "morning"),
-                            "patient_id": str(patient.id),
-                            "medication_id": str(medication.id),
-                            "is_follow_up": True,
-                        }
-
-                        await self.bolna.trigger_call(
-                            agent_id=agent_id,
-                            recipient_phone=patient.phone,
-                            user_data=user_data,
-                        )
-                        logger.info("Follow-up (safety net) triggered for patient %s", patient.name)
-
-                        # Mark retry_scheduled and follow_up_completed
-                        log_obj = (
-                            await db.execute(
-                                select(AdherenceLog).where(AdherenceLog.id == uuid.UUID(log_id))
-                            )
-                        ).scalar_one_or_none()
-                        if log_obj:
-                            log_obj.follow_up_completed = True
-                            log_obj.retry_scheduled = True
-
-                    except Exception:
-                        logger.exception(
-                            "Follow-up processing failed for entry %s", entry
-                        )
-
-                await db.commit()
+                pending = await AdherenceEngine(db).get_follow_up_patients()
+            threshold = datetime.now(timezone.utc) - _retry_delay()
+            for entry in pending:
+                if entry.get("retry_scheduled"):
+                    continue
+                created = _as_utc(datetime.fromisoformat(str(entry["created_at"])))
+                if created > threshold:
+                    continue
+                await self.schedule_retry_call(
+                    patient_id=str(entry["patient_id"]),
+                    medication_id=str(entry["medication_id"]),
+                    log_id=str(entry["adherence_log_id"]),
+                    attempt_number=1,
+                    run_at=datetime.now(timezone.utc),
+                )
         except Exception:
-            logger.exception("process_follow_ups — job failed")
-
-    # ------------------------------------------------------------------
-    # Job 3 — Send daily summaries (8 PM IST)
-    # ------------------------------------------------------------------
+            logger.exception("Follow-up processing failed")
 
     async def send_daily_summaries(self) -> None:
-        """Send a WhatsApp daily report to each active patient's family contact."""
-        logger.info("send_daily_summaries — starting")
+        """Send summaries only for the supported Tamil patient workflow."""
         try:
             async with self._session_factory() as db:
-                engine = AdherenceEngine(db)
-
                 patients_q = select(Patient).where(
-                    and_(
-                        Patient.is_active.is_(True),
-                        Patient.family_whatsapp.isnot(None),
-                    )
+                    and_(Patient.is_active.is_(True), Patient.family_whatsapp.isnot(None))
                 )
                 patients = (await db.execute(patients_q)).scalars().all()
-                logger.info("Sending daily summaries for %d patients", len(patients))
-
                 for patient in patients:
-                    try:
-                        summary = await engine.get_daily_summary(patient.id)
-                        if summary.get("error"):
-                            continue
-
-                        # Add dashboard link
-                        if settings.APP_BASE_URL:
-                            summary["dashboard_link"] = (
-                                f"{settings.APP_BASE_URL}/family/{patient.id}"
-                            )
-
-                        language = patient.language.value
-                        message = self.twilio.format_daily_summary(summary, language=language)
-
-                        await self.twilio.send_whatsapp(
-                            to=patient.family_whatsapp,
-                            body=message,
-                        )
-                        logger.info(
-                            "Daily summary sent to %s for patient %s",
-                            patient.family_whatsapp,
-                            patient.name,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Daily summary failed for patient %s", patient.name
-                        )
+                    if patient.language.value != "tamil" or not _has_call_consent(patient):
+                        logger.warning("Daily summary skipped for non-Tamil patient=%s", patient.id)
+                        continue
+                    delivered = await send_daily_summary(
+                        db=db,
+                        twilio=self.twilio,
+                        patient=patient,
+                        app_base_url=settings.APP_BASE_URL,
+                    )
+                    logger.info("Daily summary patient=%s delivered=%s", patient.id, delivered)
         except Exception:
-            logger.exception("send_daily_summaries — job failed")
+            logger.exception("Daily summary job failed")

@@ -10,6 +10,20 @@ jobs:
   backend-checks:
     name: Backend Lint & Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nalam
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nalam"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -25,12 +39,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio httpx
+          pip install pytest pytest-asyncio httpx aiosqlite
 
       - name: Python Syntax & Compilation Check
         working-directory: ./backend
         run: |
           python -m compileall app
+
+      - name: Run PostgreSQL migrations
+        working-directory: ./backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/nalam
+          SUPABASE_DATABASE_URL: ""
+        run: |
+          alembic upgrade head
 
       - name: Run Backend Tests
         working-directory: ./backend
@@ -52,11 +74,19 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v3
         with:
-          version: 9
+          version: 10.33.4
 
       - name: Install Frontend Dependencies
         working-directory: ./frontend
-        run: pnpm install --frozen-lockfile=false
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Frontend Lint
+        working-directory: ./frontend
+        run: pnpm lint
+
+      - name: Run Frontend Type Check
+        working-directory: ./frontend
+        run: pnpm exec tsc --noEmit
 
       - name: Run Frontend Build
         working-directory: ./frontend
@@ -64,3 +94,28 @@ jobs:
           NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
           NEXT_PUBLIC_WS_URL: ws://localhost:8000/api/v1/ws/dashboard
         run: pnpm build
+
+  secret-scan:
+    name: Secret Exposure Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Reject committed environment files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -E '(^|/)\.env($|\.local$)' ; then
+            echo "A non-example environment file is tracked. Remove it before merging."
+            exit 1
+          fi
+
+      - name: Scan tracked files for high-confidence credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -n -E 'sk-[A-Za-z0-9]{20,}|AC[0-9a-fA-F]{32}' -- ':!**/.env.example' ; then
+            echo "A high-confidence API credential pattern was found in tracked source."
+            exit 1
+          fi

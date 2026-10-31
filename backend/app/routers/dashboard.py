@@ -3,6 +3,7 @@
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, select
@@ -15,7 +16,10 @@ from app.models import (
     AdherenceResponseEnum,
     Alert,
     AlertTypeEnum,
+    CallRecord,
     CallSchedule,
+    CallStatusEnum,
+    ConsentStatusEnum,
     Medication,
     Patient,
     SeverityEnum,
@@ -34,7 +38,7 @@ from app.schemas import (
     TodayStatus,
     TrendPoint,
 )
-from app.services.adherence_engine import AdherenceEngine
+from app.services.adherence_engine import AdherenceEngine, RefillPrediction
 from app.services.bolna_service import BolnaService
 from app.utils.language import get_bolna_agent_id
 
@@ -75,15 +79,17 @@ async def admin_dashboard(
 
     # Per-patient summaries
     summaries: list[DashboardSummary] = []
-    score_7d_acc = 0.0
-    score_30d_acc = 0.0
+    score_7d_values: list[float] = []
+    score_30d_values: list[float] = []
 
     for patient in active:
         try:
             s7 = await engine.compute_adherence_score(patient.id, 7)
             s30 = await engine.compute_adherence_score(patient.id, 30)
-            score_7d_acc += s7
-            score_30d_acc += s30
+            if s7 is not None:
+                score_7d_values.append(s7)
+            if s30 is not None:
+                score_30d_values.append(s30)
 
             # Last call status
             last_log_q = (
@@ -117,6 +123,8 @@ async def admin_dashboard(
                     end = m.prescription_start_date + timedelta(days=m.prescription_duration_days)
                     if end <= today_date + timedelta(days=5):
                         refill_names.append(m.name)
+                elif m.stock_quantity is not None and m.stock_quantity <= m.refill_threshold:
+                    refill_names.append(m.name)
 
             summaries.append(
                 DashboardSummary(
@@ -135,10 +143,22 @@ async def admin_dashboard(
             logger.exception("Dashboard summary failed for patient %s", patient.id)
 
     # Sort worst-first
-    summaries.sort(key=lambda s: s.adherence_score_7d)
+    summaries.sort(
+        key=lambda s: s.adherence_score_7d
+        if s.adherence_score_7d is not None
+        else float("inf")
+    )
 
-    avg_7d = round(score_7d_acc / active_count, 1) if active_count else 0.0
-    avg_30d = round(score_30d_acc / active_count, 1) if active_count else 0.0
+    avg_7d = (
+        round(sum(score_7d_values) / len(score_7d_values), 1)
+        if score_7d_values
+        else None
+    )
+    avg_30d = (
+        round(sum(score_30d_values) / len(score_30d_values), 1)
+        if score_30d_values
+        else None
+    )
 
     # Alert counts by severity today
     alert_sev: dict[str, int] = {"critical": 0, "warning": 0, "info": 0}
@@ -201,11 +221,23 @@ async def family_dashboard(
     score_30d = await engine.compute_adherence_score(patient_id, 30)
 
     # ---- Today's status ----
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        patient_zone = ZoneInfo(patient.timezone_name)
+    except (ZoneInfoNotFoundError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="Patient timezone is invalid") from exc
+    local_today = datetime.now(timezone.utc).astimezone(patient_zone).date()
+    today_start = datetime.combine(local_today, datetime.min.time(), tzinfo=patient_zone).astimezone(
+        timezone.utc
+    )
+    today_end = today_start + timedelta(days=1)
     today_logs = (
         await db.execute(
             select(AdherenceLog).where(
-                and_(AdherenceLog.patient_id == patient_id, AdherenceLog.created_at >= today_start)
+                and_(
+                    AdherenceLog.patient_id == patient_id,
+                    AdherenceLog.call_time >= today_start,
+                    AdherenceLog.call_time < today_end,
+                )
             )
         )
     ).scalars().all()
@@ -243,23 +275,25 @@ async def family_dashboard(
         len(m.frequency) if isinstance(m.frequency, list) else 0
         for m in patient.medications if m.is_active
     )
-    today_date = datetime.now(timezone.utc).date()
+    today_date = local_today
     for offset in range(13, -1, -1):
         d = today_date - timedelta(days=offset)
-        ds = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+        ds = datetime.combine(d, datetime.min.time(), tzinfo=patient_zone).astimezone(
+            timezone.utc
+        )
         de = ds + timedelta(days=1)
         taken_q = (
             select(func.count()).select_from(AdherenceLog).where(
                 and_(
                     AdherenceLog.patient_id == patient_id,
-                    AdherenceLog.created_at >= ds,
-                    AdherenceLog.created_at < de,
+                    AdherenceLog.call_time >= ds,
+                    AdherenceLog.call_time < de,
                     AdherenceLog.outcome == AdherenceResponseEnum.TAKEN,
                 )
             )
         )
         taken = (await db.execute(taken_q)).scalar() or 0
-        sc = round((taken / total_freq) * 100, 1) if total_freq else 0.0
+        sc = round((taken / total_freq) * 100, 1) if total_freq else None
         trend.append(TrendPoint(date=d, score=sc, doses_taken=taken, doses_expected=total_freq))
 
     # ---- Recent alerts ----
@@ -274,21 +308,23 @@ async def family_dashboard(
 
     # ---- Medications with refill data ----
     refill_preds = await engine.get_refill_predictions(patient_id)
-    refill_map: dict[str, dict] = {r["medication_id"]: r for r in refill_preds}
+    refill_map: dict[str, RefillPrediction] = {
+        r["medication_id"]: r for r in refill_preds
+    }
 
     med_details: list[FamilyMedicationDetail] = []
     for med in patient.medications:
         if not med.is_active:
             continue
-        refill = refill_map.get(str(med.id), {})
+        refill = refill_map.get(str(med.id))
         med_details.append(
             FamilyMedicationDetail(
                 name=med.name,
                 dosage=med.dosage,
                 meal_timing=med.meal_timing.value,
                 frequency=med.frequency if isinstance(med.frequency, list) else [],
-                pills_remaining=refill.get("pills_remaining"),
-                days_until_refill=refill.get("days_remaining"),
+                pills_remaining=refill["pills_remaining"] if refill else None,
+                days_until_refill=refill["days_remaining"] if refill else None,
             )
         )
 
@@ -458,6 +494,8 @@ async def trigger_manual_call(
         raise HTTPException(status_code=404, detail="Patient not found")
     if not patient.is_active:
         raise HTTPException(status_code=400, detail="Patient is inactive")
+    if patient.consent_status != ConsentStatusEnum.granted:
+        raise HTTPException(status_code=403, detail="Patient consent is required before calling")
 
     agent_id = get_bolna_agent_id(patient.language.value)
     if not agent_id:
@@ -489,6 +527,20 @@ async def trigger_manual_call(
     bolna: BolnaService = request.app.state.bolna_service
     call_ids: list[str] = []
 
+    active_call_q = select(func.count()).select_from(CallRecord).where(
+        CallRecord.patient_id == patient_id,
+        CallRecord.status.in_(
+            [
+                CallStatusEnum.initiated,
+                CallStatusEnum.ringing,
+                CallStatusEnum.answered,
+                CallStatusEnum.in_progress,
+            ]
+        ),
+    )
+    if (await db.execute(active_call_q)).scalar_one() > 0:
+        raise HTTPException(status_code=409, detail="A call is already in progress for this patient")
+
     for med in meds:
         try:
             user_data = {
@@ -507,8 +559,19 @@ async def trigger_manual_call(
                 user_data=user_data,
             )
             cid = result.get("call_id")
-            if cid:
-                call_ids.append(cid)
+            if result.get("error") or not cid:
+                logger.error("Bolna rejected manual call patient=%s medication=%s", patient_id, med.id)
+                continue
+            call_record = CallRecord(
+                patient_id=patient.id,
+                provider_call_id=str(cid),
+                attempt_number=1,
+                status=CallStatusEnum.initiated,
+                idempotency_key=f"manual:{cid}:{patient.id}:{med.id}",
+            )
+            db.add(call_record)
+            await db.flush()
+            call_ids.append(str(cid))
         except Exception:
             logger.exception("Manual trigger failed for med %s", med.id)
 

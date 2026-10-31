@@ -76,7 +76,7 @@ export interface PatientUpdate {
   is_active?: boolean;
 }
 
-export interface PatientResponse extends Patient {}
+export type PatientResponse = Patient;
 
 export interface PatientWithMedications extends Patient {
   medications: Medication[];
@@ -121,7 +121,7 @@ export interface MedicationUpdate {
   is_active?: boolean;
 }
 
-export interface MedicationResponse extends Medication {}
+export type MedicationResponse = Medication;
 
 // ===== AdherenceLog =====
 export interface AdherenceLog {
@@ -154,7 +154,7 @@ export interface AdherenceLogCreate {
   follow_up_needed?: boolean;
 }
 
-export interface AdherenceLogResponse extends AdherenceLog {}
+export type AdherenceLogResponse = AdherenceLog;
 
 // ===== Alert =====
 export interface Alert {
@@ -169,7 +169,7 @@ export interface Alert {
   created_at: string;
 }
 
-export interface AlertResponse extends Alert {}
+export type AlertResponse = Alert;
 
 export interface AlertCountsBySeverity {
   critical: number;

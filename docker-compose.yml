@@ -30,6 +30,7 @@ services:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/nalam
+      - SUPABASE_DATABASE_URL=
       - BOLNA_API_KEY=${BOLNA_API_KEY:-}
       - BOLNA_AGENT_ID_HINDI=${BOLNA_AGENT_ID_HINDI:-}
       - BOLNA_AGENT_ID_TAMIL=${BOLNA_AGENT_ID_TAMIL:-}
@@ -37,8 +38,10 @@ services:
       - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID:-}
       - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN:-}
       - TWILIO_WHATSAPP_FROM=${TWILIO_WHATSAPP_FROM:-whatsapp:+14155238886}
-      - BACKEND_BASE_URL=http://localhost:8000
-      - FRONTEND_BASE_URL=http://localhost:3000
+      - BACKEND_PUBLIC_URL=${BACKEND_PUBLIC_URL:-http://localhost:8000}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:3000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - DEMO_FAMILY_WHATSAPP=${DEMO_FAMILY_WHATSAPP:-}
     ports:
       - "8000:8000"
 

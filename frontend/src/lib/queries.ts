@@ -229,7 +229,7 @@ export function useAdminDashboard(pharmacyId?: string) {
       });
       return data;
     },
-    refetchInterval: 60000, // 60s live refresh
+    refetchInterval: 60000, // Keep the admin summary fresh while the page is open.
   });
 }
 

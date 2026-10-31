@@ -1,36 +1,49 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Nalam frontend
 
-## Getting Started
+This is the Next.js dashboard for the Nalam medication-adherence demo. It exposes two product views:
 
-First, run the development server:
+- `/family/[patientId]` for a synthetic family dashboard.
+- `/admin` for pharmacy/admin operations and the manual demo-call control.
+
+The browser talks directly to the FastAPI service. No backend credentials belong in this project or in any `NEXT_PUBLIC_*` variable.
+
+## Local development
+
+From `frontend/`:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install --frozen-lockfile
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Create `frontend/.env.local` with the public URLs for the backend:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```dotenv
+NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+NEXT_PUBLIC_WS_URL=ws://localhost:8000/api/v1/ws/dashboard
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+The API base URL must include `/api/v1`. The WebSocket URL is optional; when configured it is used for dashboard invalidation events. These values are public browser configuration, not secrets.
 
-## Learn More
+## Verification
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+pnpm lint
+pnpm exec tsc --noEmit
+pnpm build
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The build requires a reachable backend only when a page is exercised at runtime; the Next.js production build itself uses the public URL values above.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Vercel deployment
 
-## Deploy on Vercel
+Set the Vercel project root directory to `frontend`, use the Next.js framework preset, and define:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- `NEXT_PUBLIC_API_URL=https://<backend-host>/api/v1`
+- `NEXT_PUBLIC_WS_URL=wss://<backend-host>/api/v1/ws/dashboard`
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The backend must allow the deployed Vercel origin through its `CORS_ORIGINS` setting. Do not put `BOLNA_*`, `TWILIO_*`, database URLs, or webhook secrets in Vercel environment variables.
+
+## Trust and demo limits
+
+The current backend has no user authentication and the public family route is ID-addressable. Use synthetic seeded records only until authentication and access controls are implemented. A successful page load does not verify a Bolna call or Twilio WhatsApp delivery.

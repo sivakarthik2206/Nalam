@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useCreatePatient, useAddMedication } from "@/lib/queries";
 import { Language, MealTiming, PatientCreate, MedicationCreate } from "@/lib/types";
+import { getApiErrorMessage } from "@/lib/utils";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -112,11 +113,8 @@ export function PatientForm() {
 
       // 3. Redirect to patient detail page
       router.push(`/admin/patients/${newPatient.id}`);
-    } catch (err: any) {
-      console.error(err);
-      setErrorMsg(
-        err?.response?.data?.detail || "Failed to onboard patient. Please try again."
-      );
+    } catch (err: unknown) {
+      setErrorMsg(getApiErrorMessage(err));
       setIsSubmitting(false);
     }
   };

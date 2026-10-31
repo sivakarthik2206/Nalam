@@ -1,34 +1,25 @@
 "use client";
 
-import { useRouter } from "next/navigation";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import Link from "next/link";
+import { AlertTriangle, ChevronRight, UserRound } from "lucide-react";
+import { AlertResponse, DashboardSummary } from "@/lib/types";
+import { getAdherenceColor, getDoseStatusColor, formatDate } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { DashboardSummary } from "@/lib/types";
-import { getAdherenceColor, getDoseStatusColor } from "@/lib/utils";
-import { PhoneCall, ExternalLink, ChevronRight, User } from "lucide-react";
-import { useTriggerCall } from "@/lib/queries";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 interface PatientTableProps {
   patients: DashboardSummary[];
+  alerts?: AlertResponse[];
   isLoading?: boolean;
 }
 
-export function PatientTable({ patients, isLoading }: PatientTableProps) {
-  const router = useRouter();
-
+export function PatientTable({ patients, alerts = [], isLoading = false }: PatientTableProps) {
   if (isLoading) {
     return (
-      <div className="space-y-3">
-        {[1, 2, 3, 4, 5].map((i) => (
-          <div key={i} className="h-12 bg-slate-100 rounded-lg animate-pulse" />
+      <div className="space-y-3 p-5" aria-label="Loading patients">
+        {["one", "two", "three", "four"].map((key) => (
+          <div key={key} className="h-12 animate-pulse rounded-lg bg-slate-100" />
         ))}
       </div>
     );
@@ -36,101 +27,99 @@ export function PatientTable({ patients, isLoading }: PatientTableProps) {
 
   if (patients.length === 0) {
     return (
-      <div className="text-center py-12 px-4 border border-dashed border-slate-200 rounded-xl bg-slate-50/50">
-        <User className="w-8 h-8 text-slate-400 mx-auto mb-2" />
-        <h4 className="text-sm font-semibold text-slate-700">No Patients Enrolled</h4>
-        <p className="text-xs text-slate-500 mt-1 max-w-xs mx-auto">
-          Start onboarding patients to begin automated voice adherence tracking.
+      <div className="border border-dashed border-slate-200 bg-slate-50/60 px-4 py-14 text-center">
+        <UserRound className="mx-auto mb-2 h-8 w-8 text-slate-400" aria-hidden="true" />
+        <h4 className="text-sm font-semibold text-slate-800">No active patients</h4>
+        <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-slate-600">
+          The backend returned no active patient records for this pharmacy.
         </p>
-        <Button
-          size="sm"
-          className="mt-4 bg-emerald-600 hover:bg-emerald-700 text-white"
-          onClick={() => router.push("/onboard")}
-        >
-          Add Patient
-        </Button>
       </div>
     );
   }
 
+  const latestAlertByPatient = new Map<string, AlertResponse>();
+  for (const alert of alerts) {
+    if (!latestAlertByPatient.has(alert.patient_id)) latestAlertByPatient.set(alert.patient_id, alert);
+  }
+
   return (
-    <div className="overflow-x-auto rounded-lg border border-slate-200">
+    <div className="overflow-x-auto">
       <Table>
-        <TableHeader className="bg-slate-50/75">
+        <TableHeader className="bg-sky-50/60">
           <TableRow>
-            <TableHead className="font-semibold text-slate-700">Patient</TableHead>
-            <TableHead className="font-semibold text-slate-700">Phone</TableHead>
-            <TableHead className="font-semibold text-slate-700 text-center">7d Score</TableHead>
-            <TableHead className="font-semibold text-slate-700">Last Status</TableHead>
-            <TableHead className="font-semibold text-slate-700 text-right">Action</TableHead>
+            <TableHead className="whitespace-nowrap text-xs font-semibold text-slate-700">Patient</TableHead>
+            <TableHead className="whitespace-nowrap text-xs font-semibold text-slate-700">Contact</TableHead>
+            <TableHead className="whitespace-nowrap text-center text-xs font-semibold text-slate-700">7d adherence</TableHead>
+            <TableHead className="whitespace-nowrap text-xs font-semibold text-slate-700">Last call status</TableHead>
+            <TableHead className="whitespace-nowrap text-xs font-semibold text-slate-700">Refill</TableHead>
+            <TableHead className="whitespace-nowrap text-xs font-semibold text-slate-700">Latest alert</TableHead>
+            <TableHead className="text-right text-xs font-semibold text-slate-700">Action</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {patients.map((patient) => {
             const adherenceStyle = getAdherenceColor(patient.adherence_score_7d);
-            const statusStyle = patient.last_call_status
-              ? getDoseStatusColor(patient.last_call_status)
-              : null;
+            const callStyle = patient.last_call_status ? getDoseStatusColor(patient.last_call_status) : null;
+            const patientAlert = latestAlertByPatient.get(patient.patient_id);
 
             return (
-              <TableRow
-                key={patient.patient_id}
-                className="cursor-pointer hover:bg-slate-50/80 transition-colors group"
-                onClick={() => router.push(`/admin/patients/${patient.patient_id}`)}
-              >
-                <TableCell className="font-medium text-slate-900">
-                  <div className="flex items-center gap-2">
-                    <span className="font-semibold group-hover:text-emerald-700 transition-colors">
-                      {patient.patient_name}
-                    </span>
-                    {patient.refill_due_medications &&
-                      patient.refill_due_medications.length > 0 && (
-                        <span
-                          className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-800 bg-amber-100 border border-amber-300 px-1.5 py-0.5 rounded-full"
-                          title={patient.refill_due_medications.join(", ")}
-                        >
-                          <span className="w-1.5 h-1.5 rounded-full bg-amber-500 inline-block" />
-                          {patient.refill_due_medications.length} med{patient.refill_due_medications.length !== 1 ? "s" : ""} due
-                        </span>
-                      )}
+              <TableRow key={patient.patient_id} className="align-top hover:bg-sky-50/30">
+                <TableCell>
+                  <div className="min-w-36">
+                    <p className="font-semibold text-slate-950">{patient.patient_name}</p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      {patient.medications_count} medication{patient.medications_count === 1 ? "" : "s"}
+                    </p>
                   </div>
-                  <span className="text-[11px] text-slate-400">
-                    {patient.medications_count} medication{patient.medications_count !== 1 ? "s" : ""}
-                  </span>
                 </TableCell>
-                <TableCell className="text-xs text-slate-600 font-mono">
-                  {patient.patient_phone || "—"}
+                <TableCell className="text-xs text-slate-700">
+                  <span className="whitespace-nowrap font-mono">{patient.patient_phone || "Not provided"}</span>
+                  <span className="mt-1 block text-[11px] text-slate-500">Patient contact on file</span>
                 </TableCell>
                 <TableCell className="text-center">
-                  <Badge
-                    variant="outline"
-                    className={`font-semibold border text-xs px-2 py-0.5 ${adherenceStyle.badge}`}
-                  >
+                  <Badge variant="outline" className={`text-xs font-semibold ${adherenceStyle.badge}`}>
                     {patient.adherence_score_7d}%
                   </Badge>
                 </TableCell>
                 <TableCell>
-                  {statusStyle ? (
+                  {callStyle ? (
                     <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-700">
-                      <span className={`w-2 h-2 rounded-full ${statusStyle.dot}`} />
-                      {statusStyle.label}
+                      <span className={`h-2 w-2 rounded-full ${callStyle.dot}`} aria-hidden="true" />
+                      {callStyle.label}
                     </span>
                   ) : (
-                    <span className="text-xs text-slate-400">No calls yet</span>
+                    <span className="text-xs text-slate-500">No call logged</span>
                   )}
                 </TableCell>
-                <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
-                  <div className="flex items-center justify-end gap-1">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-8 w-8 p-0 text-slate-500 hover:text-emerald-700"
-                      onClick={() => router.push(`/admin/patients/${patient.patient_id}`)}
-                      title="View Details"
-                    >
-                      <ChevronRight className="w-4 h-4" />
+                <TableCell>
+                  {patient.refill_due_medications.length > 0 ? (
+                    <div className="flex items-start gap-1.5 text-xs font-medium text-amber-900">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" aria-hidden="true" />
+                      <span>{patient.refill_due_medications.join(", ")}</span>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-slate-500">No refill flag</span>
+                  )}
+                </TableCell>
+                <TableCell className="max-w-52">
+                  {patientAlert ? (
+                    <div>
+                      <p className="truncate text-xs font-medium text-slate-800">{patientAlert.message}</p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {formatDate(patientAlert.created_at, "MMM d, h:mm a")} · {patientAlert.is_read ? "Acknowledged" : "Open"}
+                      </p>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-slate-500">No alert history</span>
+                  )}
+                </TableCell>
+                <TableCell className="text-right">
+                  <Link href={`/family/${patient.patient_id}`}>
+                    <Button type="button" variant="outline" size="sm" className="gap-1 border-sky-200 text-sky-800 hover:bg-sky-50">
+                      Family view
+                      <ChevronRight aria-hidden="true" />
                     </Button>
-                  </div>
+                  </Link>
                 </TableCell>
               </TableRow>
             );

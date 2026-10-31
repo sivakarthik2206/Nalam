@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useAddMedication } from "@/lib/queries";
 import { MedicationCreate, MealTiming } from "@/lib/types";
+import { getApiErrorMessage } from "@/lib/utils";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -77,8 +78,8 @@ export function MedicationForm({ patientId, onSuccess }: MedicationFormProps) {
         setDosage("1 tablet");
         if (onSuccess) onSuccess();
       },
-      onError: (err: any) => {
-        setErrorMsg(err?.response?.data?.detail || "Failed to add medication");
+      onError: (err: unknown) => {
+        setErrorMsg(getApiErrorMessage(err));
       },
     });
   };

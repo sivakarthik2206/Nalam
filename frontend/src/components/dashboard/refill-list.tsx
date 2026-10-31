@@ -56,7 +56,7 @@ export function RefillList({ refills, isLoading }: RefillListProps) {
             <div>
               <div className="flex items-center gap-2">
                 <Link
-                  href={`/admin/patients/${refill.patient_id}`}
+                  href={`/family/${refill.patient_id}`}
                   className="font-bold text-slate-900 hover:text-emerald-700 text-sm"
                 >
                   {refill.patient_name}
@@ -81,9 +81,9 @@ export function RefillList({ refills, isLoading }: RefillListProps) {
           </div>
 
           <div className="flex items-center gap-2 self-end sm:self-center">
-            <Link href={`/admin/patients/${refill.patient_id}`}>
+            <Link href={`/family/${refill.patient_id}`}>
               <Button size="sm" variant="outline" className="text-xs border-slate-300">
-                View Patient
+                Family view
               </Button>
             </Link>
           </div>

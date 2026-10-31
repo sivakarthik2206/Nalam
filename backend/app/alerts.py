@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,7 @@ from app.models import (
     Alert,
     AlertTypeEnum,
     ChannelEnum,
+    DeliveryStatusEnum,
     Medication,
     Patient,
     SeverityEnum,
@@ -25,6 +27,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEDUP_HOURS = 6
+
+
+def _delivery_succeeded(result: object) -> bool:
+    return isinstance(result, Mapping) and not result.get("error") and bool(result.get("sid"))
+
+
+def _delivery_retryable(result: object) -> bool:
+    return isinstance(result, Mapping) and bool(result.get("retryable", False))
 
 
 async def _recent_alert_exists(
@@ -210,6 +220,7 @@ async def evaluate_escalations(
         await db.flush()
     except Exception:
         logger.exception("Escalation rule check failed for patient %s", patient_id)
+        raise
 
     return alerts_created
 
@@ -238,13 +249,16 @@ async def send_daily_summary(
         if not to:
             return False
 
-        try:
-            await twilio.send_whatsapp(to=to, body=message)
-            logger.info("Daily summary sent to %s for patient %s", to, patient.name)
-            return True
-        except Exception:
-            logger.exception("Failed to send daily summary to %s", to)
+        result = await twilio.send_whatsapp(to=to, body=message)
+        if not _delivery_succeeded(result):
+            logger.error(
+                "Daily summary delivery failed patient=%s retryable=%s",
+                patient.id,
+                _delivery_retryable(result),
+            )
             return False
+        logger.info("Daily summary delivered patient=%s", patient.id)
+        return True
     except Exception:
         logger.exception("send_daily_summary failed for patient %s", patient.id)
         return False
@@ -268,12 +282,11 @@ async def send_refill_alert(
         to = patient.family_whatsapp
         if not to:
             return False
-        try:
-            await twilio.send_whatsapp(to=to, body=body)
-            return True
-        except Exception:
-            logger.exception("send_refill_alert failed sending to %s", to)
+        result = await twilio.send_whatsapp(to=to, body=body)
+        if not _delivery_succeeded(result):
+            logger.error("Refill alert delivery failed patient=%s", patient.id)
             return False
+        return True
     except Exception:
         logger.exception("send_refill_alert failed for patient %s", patient.id)
         return False
@@ -297,12 +310,11 @@ async def send_side_effect_alert(
         to = patient.family_whatsapp
         if not to:
             return False
-        try:
-            await twilio.send_whatsapp(to=to, body=body)
-            return True
-        except Exception:
-            logger.exception("send_side_effect_alert failed sending to %s", to)
+        result = await twilio.send_whatsapp(to=to, body=body)
+        if not _delivery_succeeded(result):
+            logger.error("Side-effect alert delivery failed patient=%s", patient.id)
             return False
+        return True
     except Exception:
         logger.exception("send_side_effect_alert failed for patient %s", patient.id)
         return False
@@ -323,12 +335,74 @@ async def send_no_answer_alert(
         to = patient.family_whatsapp
         if not to:
             return False
-        try:
-            await twilio.send_whatsapp(to=to, body=body)
-            return True
-        except Exception:
-            logger.exception("send_no_answer_alert failed sending to %s", to)
+        result = await twilio.send_whatsapp(to=to, body=body)
+        if not _delivery_succeeded(result):
+            logger.error("No-answer alert delivery failed patient=%s", patient.id)
             return False
+        return True
     except Exception:
         logger.exception("send_no_answer_alert failed for patient %s", patient.id)
         return False
+
+
+async def send_alert_notifications(
+    twilio: "TwilioService",
+    alerts: list[Alert],
+    patient: Patient,
+    db: AsyncSession | None = None,
+) -> tuple[int, int]:
+    """Deliver generated alerts and report ``(delivered, failed)`` counts.
+
+    The Alert row is committed before this function is called. Twilio performs
+    bounded transport retries, while this function keeps provider failures
+    observable and never treats an error response as delivery success.
+    When a database session is supplied, the existing Alert delivery fields are
+    updated so dashboard operators can distinguish pending, sent, and failed.
+    """
+    delivered = 0
+    failed = 0
+    for alert in alerts:
+        if not alert.sent_to or alert.channel != ChannelEnum.whatsapp:
+            continue
+        alert.delivery_attempt_count += 1
+        alert.delivery_status = DeliveryStatusEnum.sending
+        if db is not None:
+            await db.flush()
+        body = twilio.format_alert(
+            alert_type=alert.alert_type.value,
+            patient_name=patient.name,
+            details=alert.message,
+            language="tamil",
+        )
+        try:
+            result = await twilio.send_whatsapp(to=alert.sent_to, body=body)
+        except Exception:
+            failed += 1
+            alert.delivery_status = DeliveryStatusEnum.failed
+            alert.delivery_failure_reason = "provider_exception"
+            logger.exception("Alert delivery raised patient=%s alert_id=%s", patient.id, alert.id)
+            continue
+        if not _delivery_succeeded(result):
+            failed += 1
+            alert.delivery_status = DeliveryStatusEnum.failed
+            alert.delivery_failure_reason = (
+                str(result.get("detail", "provider_rejected"))[:500]
+                if isinstance(result, Mapping)
+                else "provider_rejected"
+            )
+            logger.error(
+                "Alert delivery failed patient=%s alert_id=%s retryable=%s",
+                patient.id,
+                alert.id,
+                _delivery_retryable(result),
+            )
+            continue
+        delivered += 1
+        alert.delivery_status = DeliveryStatusEnum.sent
+        if isinstance(result, Mapping):
+            provider_sid = result.get("sid")
+            alert.provider_message_id = provider_sid if isinstance(provider_sid, str) else None
+        logger.info("Alert delivered patient=%s alert_id=%s", patient.id, alert.id)
+    if db is not None:
+        await db.commit()
+    return delivered, failed

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Menu, Heart, UserPlus } from "lucide-react";
+import { Menu, Heart } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -27,22 +27,22 @@ export function MobileNav() {
       >
         <Menu className="w-5 h-5" />
       </SheetTrigger>
-      <SheetContent side="left" className="w-[280px] p-0 bg-slate-900 border-slate-800 text-white">
-        <SheetHeader className="h-16 flex flex-row items-center px-6 gap-3 border-b border-slate-800 space-y-0 text-left">
-          <div className="w-9 h-9 rounded-xl bg-emerald-600 flex items-center justify-center">
+      <SheetContent side="left" className="w-[280px] p-0 bg-sky-950 border-sky-900 text-white">
+        <SheetHeader className="h-16 flex flex-row items-center px-6 gap-3 border-b border-sky-900 space-y-0 text-left">
+          <div className="w-9 h-9 rounded-xl bg-sky-600 flex items-center justify-center">
             <Heart className="w-5 h-5 text-white fill-white" />
           </div>
           <div>
             <SheetTitle className="text-lg font-bold text-white leading-tight">
               Nalam Care
             </SheetTitle>
-            <p className="text-[11px] text-slate-400">Adherence Platform</p>
+            <p className="text-[11px] text-sky-200/70">Family care operations</p>
           </div>
         </SheetHeader>
 
         <div className="py-6 px-4 space-y-1.5">
-          <div className="px-3 pb-2 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-            Navigation
+          <div className="px-3 pb-2 text-[10px] font-semibold uppercase tracking-wider text-sky-200/70">
+            Admin screen
           </div>
           {navItems.map((item) => {
             const Icon = item.icon;
@@ -59,8 +59,8 @@ export function MobileNav() {
                 className={cn(
                   "flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium transition-all",
                   isActive
-                    ? "bg-emerald-600 text-white"
-                    : "text-slate-300 hover:text-white hover:bg-slate-800"
+                    ? "bg-sky-600 text-white"
+                    : "text-sky-100/80 hover:text-white hover:bg-sky-900"
                 )}
               >
                 <Icon className="w-4 h-4" />
@@ -68,18 +68,6 @@ export function MobileNav() {
               </Link>
             );
           })}
-
-          <div className="pt-4 px-3 pb-2 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-            Actions
-          </div>
-          <Link
-            href="/onboard"
-            onClick={() => setOpen(false)}
-            className="flex items-center gap-3 px-3.5 py-2.5 rounded-lg text-sm font-medium text-emerald-400 hover:bg-slate-800 transition-all"
-          >
-            <UserPlus className="w-4 h-4" />
-            <span>Onboard Patient</span>
-          </Link>
         </div>
       </SheetContent>
     </Sheet>

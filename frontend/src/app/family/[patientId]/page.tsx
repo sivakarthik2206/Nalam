@@ -1,249 +1,224 @@
 "use client";
 
-import { useState, useEffect } from "react";
 import { useParams } from "next/navigation";
-import { useFamilyDashboard } from "@/lib/queries";
 import {
-  Heart,
-  Clock,
-  CheckCircle2,
-  XCircle,
-  AlertTriangle,
-  Pill,
-  Sparkles,
-  Calendar,
-  ShieldCheck,
-  RefreshCw,
   AlertCircle,
+  AlertTriangle,
+  CheckCircle2,
+  Clock3,
+  Heart,
+  Pill,
+  RefreshCw,
+  ShieldCheck,
+  XCircle,
 } from "lucide-react";
-import { Card, CardContent } from "@/components/ui/card";
+import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { useAdherenceHistory, useDailyStatus, useFamilyDashboard } from "@/lib/queries";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  Cell,
-} from "recharts";
-import { formatDate, formatTime } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { getApiErrorMessage, getAdherenceColor, formatDate, formatMealTiming, formatTime } from "@/lib/utils";
+
+type DoseStatus = "taken" | "missed" | "pending" | "side_effect";
+
+interface FamilyDose {
+  medicationName: string;
+  timeSlot: string;
+  mealTiming?: string;
+  status: DoseStatus;
+  loggedAt?: string | null;
+}
+
+function statusCopy(status: DoseStatus): { label: string; className: string; icon: typeof CheckCircle2 } {
+  switch (status) {
+    case "taken":
+      return { label: "Taken confirmed", className: "border-emerald-200 bg-emerald-50 text-emerald-800", icon: CheckCircle2 };
+    case "missed":
+      return { label: "Missed dose", className: "border-rose-200 bg-rose-50 text-rose-800", icon: XCircle };
+    case "side_effect":
+      return { label: "Side effect reported", className: "border-violet-200 bg-violet-50 text-violet-800", icon: AlertCircle };
+    default:
+      return { label: "Awaiting check-in", className: "border-amber-200 bg-amber-50 text-amber-900", icon: Clock3 };
+  }
+}
+
+function LoadingState() {
+  return (
+    <main className="min-h-screen bg-sky-50/60 px-4 py-8 sm:px-6 sm:py-12">
+      <div className="mx-auto max-w-4xl space-y-5" aria-label="Loading family dashboard">
+        {["header", "summary", "chart", "medications"].map((key) => (
+          <div key={key} className="h-32 animate-pulse rounded-3xl border border-sky-100 bg-white" />
+        ))}
+      </div>
+    </main>
+  );
+}
 
 export default function FamilyDashboardPage() {
-  const params = useParams();
-  const patientId = (params?.patientId as string) || "";
+  const params = useParams<{ patientId: string }>();
+  const patientId = params?.patientId ?? "";
+  const familyQuery = useFamilyDashboard(patientId);
+  const dailyQuery = useDailyStatus(patientId);
+  const historyQuery = useAdherenceHistory(patientId, 7);
+  const lastUpdatedText = familyQuery.dataUpdatedAt
+    ? formatTime(new Date(familyQuery.dataUpdatedAt).toISOString())
+    : "Not updated yet";
 
-  const { data, isLoading, dataUpdatedAt } = useFamilyDashboard(patientId);
+  if (familyQuery.isLoading) return <LoadingState />;
 
-  const [lastUpdatedText, setLastUpdatedText] = useState("Just now");
-
-  useEffect(() => {
-    if (dataUpdatedAt) {
-      const date = new Date(dataUpdatedAt);
-      setLastUpdatedText(
-        date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      );
-    }
-  }, [dataUpdatedAt]);
-
-  if (isLoading) {
+  if (familyQuery.isError || !familyQuery.data) {
     return (
-      <div className="min-h-screen bg-amber-50/30 py-12 px-4 sm:px-6">
-        <div className="max-w-3xl mx-auto space-y-6 animate-pulse">
-          <div className="h-28 bg-white rounded-3xl border border-amber-100 shadow-xs" />
-          <div className="h-48 bg-white rounded-3xl border border-amber-100 shadow-xs" />
-          <div className="h-56 bg-white rounded-3xl border border-amber-100 shadow-xs" />
+      <main className="min-h-screen bg-sky-50/60 px-4 py-12 sm:px-6">
+        <div className="mx-auto max-w-xl">
+          <Alert variant="destructive">
+            <AlertTitle>Family dashboard unavailable</AlertTitle>
+            <AlertDescription className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <span>{getApiErrorMessage(familyQuery.error)}</span>
+              <Button type="button" variant="outline" size="sm" onClick={() => familyQuery.refetch()}>
+                <RefreshCw aria-hidden="true" />
+                Retry
+              </Button>
+            </AlertDescription>
+          </Alert>
         </div>
-      </div>
+      </main>
     );
   }
 
-  if (!data) {
-    return (
-      <div className="min-h-screen bg-amber-50/30 flex items-center justify-center p-4">
-        <div className="max-w-md w-full bg-white rounded-3xl border border-amber-100 p-8 text-center shadow-sm">
-          <div className="w-14 h-14 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mx-auto mb-3">
-            <Heart className="w-7 h-7" />
-          </div>
-          <h2 className="text-xl font-bold text-slate-800">Care Link Not Found</h2>
-          <p className="text-xs text-slate-500 mt-2 leading-relaxed">
-            This private family dashboard link is either invalid or inactive. Please contact
-            the dispensing clinic or pharmacy.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  // Greeting title based on language
-  const greetingTitle =
-    data.patient_language === "tamil"
-      ? `${data.patient_name} (Amma)'s Health Update`
-      : data.patient_language === "hindi"
-      ? `${data.patient_name} (Maata) ka Health Update`
-      : `${data.patient_name}'s Health Update`;
-
-  // Doses calculation
-  const todayList = data.today || [];
-  const takenCount = todayList.filter((d) => d.status === "taken").length;
-  const totalToday = todayList.length;
-
-  // 7-day bar chart data
-  const weeklyData = (data.trend || []).slice(-7).map((d) => {
-    return {
-      date: formatDate(d.date, "EEE"),
-      fullDate: formatDate(d.date, "MMM d"),
-      score: d.score,
-    };
-  });
-
-  // Recent 5 alerts
-  const recentAlerts = (data.recent_alerts || []).slice(0, 5);
+  const data = familyQuery.data;
+  const dailyDoses: FamilyDose[] = dailyQuery.data?.medications.map((dose) => ({
+    medicationName: dose.medication_name ?? dose.name,
+    timeSlot: dose.time_slot,
+    mealTiming: dose.meal_timing,
+    status: dose.status,
+    loggedAt: dose.logged_at,
+  })) ?? data.today.map((dose) => ({
+    medicationName: dose.medication_name || dose.name || "Medicine",
+    timeSlot: dose.time_slot,
+    status: dose.status === "not_taken" ? "missed" : dose.status,
+  }));
+  const takenCount = dailyDoses.filter((dose) => dose.status === "taken").length;
+  const adherenceStyle = getAdherenceColor(data.adherence_score_7d);
+  const recentAlerts = data.recent_alerts.slice(0, 8);
+  const history = historyQuery.data ?? [];
+  const latestTaken = history.find((log) => log.outcome.toUpperCase() === "TAKEN");
+  const latestLog = history[0];
+  const weeklyData = data.trend.slice(-7).map((point) => ({
+    ...point,
+    shortDate: formatDate(point.date, "EEE"),
+    fullDate: formatDate(point.date, "MMM d, yyyy"),
+  }));
+  const todaySummary = dailyDoses.length === 0
+    ? "No doses scheduled today"
+    : dailyDoses.every((dose) => dose.status === "taken")
+      ? "All scheduled doses confirmed"
+      : dailyDoses.some((dose) => dose.status === "missed" || dose.status === "side_effect")
+        ? "Follow-up needed"
+        : "Check-ins still pending";
 
   return (
-    <div className="min-h-screen bg-[#faf8f5] text-slate-800 font-sans py-8 sm:py-12 px-4 sm:px-6 lg:px-8 selection:bg-emerald-100">
-      <div className="max-w-3xl mx-auto space-y-8">
-        {/* HEADER */}
-        <header className="bg-white rounded-3xl border border-emerald-100/70 p-6 sm:p-8 shadow-sm">
-          <div className="flex items-center justify-between pb-4 border-b border-slate-100">
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-2xl bg-emerald-600 flex items-center justify-center text-white shadow-xs">
-                <Heart className="w-5 h-5 fill-white text-white" />
+    <main className="min-h-screen bg-sky-50/60 px-4 py-6 text-slate-900 sm:px-6 sm:py-10">
+      <div className="mx-auto max-w-4xl space-y-6">
+        <header className="rounded-3xl border border-sky-200 bg-white p-5 shadow-sm sm:p-8">
+          <div className="flex flex-col gap-4 border-b border-slate-100 pb-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-700 text-white" aria-hidden="true">
+                <Heart className="h-5 w-5 fill-white" />
               </div>
-              <span className="font-bold text-slate-900 text-sm tracking-tight">
-                Nalam Care
-              </span>
-              <span className="text-xs text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-full font-semibold border border-emerald-200">
-                Family Dashboard
-              </span>
+              <div>
+                <p className="text-lg font-bold tracking-tight text-slate-950">Nalam</p>
+                <p className="text-xs text-slate-600">Family medication update</p>
+              </div>
             </div>
-
-            <div className="flex items-center gap-2 text-xs text-slate-400">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span>Live &bull; {lastUpdatedText}</span>
+            <div className="flex items-center gap-2 text-xs text-slate-600" aria-live="polite">
+              <span className="h-2 w-2 rounded-full bg-sky-600" aria-hidden="true" />
+              Updated {lastUpdatedText}
             </div>
           </div>
 
-          <div className="mt-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="mt-6 flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
             <div>
-              <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">
-                {greetingTitle}
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700">Family view</p>
+              <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-950 sm:text-3xl">
+                {data.patient_name}&apos;s medication update
               </h1>
-              <p className="text-xs sm:text-sm text-slate-500 mt-1 font-medium">
-                Daily check-ins powered by automated AI voice calls in{" "}
-                <span className="capitalize text-emerald-700 font-bold">
-                  {data.patient_language}
-                </span>
+              <p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-600">
+                A simple view of today&apos;s check-ins, recent adherence, supplies, and alerts recorded by Nalam.
               </p>
             </div>
-
-            {data.next_scheduled_call && (
-              <div className="p-3 rounded-2xl bg-emerald-50/70 border border-emerald-200/60 text-xs text-emerald-900 shrink-0">
-                <p className="text-[10px] uppercase font-bold text-emerald-700 tracking-wider">
-                  Next Phone Check-in
-                </p>
-                <p className="font-bold text-sm mt-0.5">
-                  {formatDate(data.next_scheduled_call, "h:mm a")} today
-                </p>
-              </div>
-            )}
+            <div className={`rounded-2xl border px-4 py-3 ${adherenceStyle.bg} ${adherenceStyle.border}`}>
+              <p className="text-xs font-semibold text-slate-700">Seven-day adherence</p>
+              <p className={`mt-1 text-3xl font-bold ${adherenceStyle.text}`}>{data.adherence_score_7d}%</p>
+            </div>
           </div>
         </header>
 
-        {/* SECTION 1: TODAY'S MEDICINES */}
-        <section className="space-y-4">
-          <div className="flex items-center justify-between px-1">
-            <div>
-              <h2 className="text-lg font-bold text-slate-900">
-                Today&apos;s Medicines
-              </h2>
-              <p className="text-xs text-slate-500 font-medium">
-                Status reported during today&apos;s scheduled reminder calls
+        <section className="grid gap-4 sm:grid-cols-3" aria-label="Patient overview">
+          <Card className="border-sky-200 bg-white shadow-sm">
+            <CardContent className="p-5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Today&apos;s call status</p>
+              <p className="mt-2 text-base font-semibold text-slate-950">{todaySummary}</p>
+              <p className="mt-1 text-xs text-slate-600">{takenCount} of {dailyDoses.length} scheduled doses confirmed</p>
+            </CardContent>
+          </Card>
+          <Card className="border-sky-200 bg-white shadow-sm">
+            <CardContent className="p-5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Last successful confirmation</p>
+              <p className="mt-2 text-base font-semibold text-slate-950">{formatDate(latestTaken?.call_time, "MMM d, h:mm a")}</p>
+              <p className="mt-1 text-xs text-slate-600">Taken responses recorded in the last 7 days</p>
+            </CardContent>
+          </Card>
+          <Card className="border-sky-200 bg-white shadow-sm">
+            <CardContent className="p-5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Latest call record</p>
+              <p className="mt-2 text-base font-semibold text-slate-950">
+                {latestLog ? `${latestLog.outcome.replaceAll("_", " ")}` : "No call logged"}
               </p>
-            </div>
-            {totalToday > 0 && (
-              <div className="text-xs font-bold px-3 py-1 rounded-full bg-emerald-100 text-emerald-800">
-                {takenCount} of {totalToday} doses taken
-              </div>
-            )}
-          </div>
+              <p className="mt-1 text-xs text-slate-600">{formatDate(latestLog?.call_time, "MMM d, h:mm a")}</p>
+            </CardContent>
+          </Card>
+        </section>
 
-          {todayList.length === 0 ? (
-            <div className="p-8 text-center bg-white rounded-3xl border border-slate-200 text-xs text-slate-400">
-              No medications scheduled for today.
+        {dailyQuery.isError && (
+          <Alert>
+            <AlertTriangle aria-hidden="true" />
+            <AlertTitle>Today&apos;s detailed dose status is unavailable</AlertTitle>
+            <AlertDescription>{getApiErrorMessage(dailyQuery.error)} The summary above is from the family dashboard response.</AlertDescription>
+          </Alert>
+        )}
+
+        <section className="space-y-3" aria-labelledby="today-heading">
+          <div>
+            <h2 id="today-heading" className="text-xl font-bold text-slate-950">Today&apos;s medicines</h2>
+            <p className="mt-1 text-sm text-slate-600">Statuses come from today&apos;s recorded adherence events.</p>
+          </div>
+          {dailyDoses.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-600">
+              No active medication doses were returned for today.
             </div>
           ) : (
-            <div className="space-y-3">
-              {todayList.map((item, index) => {
-                const medName = item.medication_name || item.name || "Medicine";
-                const isTaken = item.status === "taken";
-                const isMissed = item.status === "not_taken";
-                const isPending = item.status === "pending";
-
+            <div className="grid gap-3 sm:grid-cols-2">
+              {dailyDoses.map((dose, index) => {
+                const status = statusCopy(dose.status);
+                const StatusIcon = status.icon;
                 return (
-                  <Card
-                    key={`${item.time_slot}-${medName}-${index}`}
-                    className={`rounded-2xl border transition-all ${
-                      isTaken
-                        ? "bg-white border-emerald-200 shadow-xs"
-                        : isMissed
-                        ? "bg-rose-50/40 border-rose-200 shadow-xs"
-                        : "bg-white border-slate-200 shadow-2xs"
-                    }`}
-                  >
-                    <CardContent className="p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                      <div className="flex items-start gap-3.5">
-                        <div
-                          className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${
-                            isTaken
-                              ? "bg-emerald-100 text-emerald-700"
-                              : isMissed
-                              ? "bg-rose-100 text-rose-700"
-                              : "bg-amber-100 text-amber-700"
-                          }`}
-                        >
-                          <Pill className="w-5 h-5" />
-                        </div>
-
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <h3 className="font-bold text-base text-slate-900">
-                              {medName}
-                            </h3>
-                            <Badge
-                              variant="outline"
-                              className="text-[10px] font-semibold bg-slate-50 border-slate-200"
-                            >
-                              {item.time_slot}
-                            </Badge>
-                          </div>
-                          <p className="text-xs text-slate-500 mt-0.5">
-                            Take with water as prescribed
+                  <Card key={`${dose.medicationName}-${dose.timeSlot}-${index}`} className="border-slate-200 bg-white shadow-sm">
+                    <CardContent className="flex items-start justify-between gap-4 p-5">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <div className="rounded-xl bg-sky-100 p-2.5 text-sky-700" aria-hidden="true"><Pill className="h-5 w-5" /></div>
+                        <div className="min-w-0">
+                          <h3 className="truncate font-semibold text-slate-950">{dose.medicationName}</h3>
+                          <p className="mt-1 text-xs capitalize text-slate-600">
+                            {dose.timeSlot}{dose.mealTiming ? ` · ${formatMealTiming(dose.mealTiming)}` : ""}
                           </p>
+                          {dose.loggedAt && <p className="mt-1 text-[11px] text-slate-500">Recorded {formatTime(dose.loggedAt)}</p>}
                         </div>
                       </div>
-
-                      {/* Large friendly status badge */}
-                      <div className="shrink-0 self-end sm:self-center">
-                        {isTaken && (
-                          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold">
-                            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                            <span>Taken Confirmed</span>
-                          </div>
-                        )}
-                        {isMissed && (
-                          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-bold">
-                            <XCircle className="w-4 h-4 text-rose-600" />
-                            <span>Missed Dose</span>
-                          </div>
-                        )}
-                        {isPending && (
-                          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold">
-                            <Clock className="w-4 h-4 text-amber-600" />
-                            <span>Upcoming Call</span>
-                          </div>
-                        )}
-                      </div>
+                      <span className={`inline-flex shrink-0 items-center gap-1 rounded-xl border px-2 py-1 text-[11px] font-semibold ${status.className}`}>
+                        <StatusIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span className="sr-only">{dose.medicationName}: </span>{status.label}
+                      </span>
                     </CardContent>
                   </Card>
                 );
@@ -252,225 +227,132 @@ export default function FamilyDashboardPage() {
           )}
         </section>
 
-        {/* SECTION 2: THIS WEEK (7-Bar Chart) */}
-        <section className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-8 shadow-sm space-y-4">
-          <div className="flex items-baseline justify-between">
-            <div>
-              <h2 className="text-lg font-bold text-slate-900">This Week</h2>
-              <p className="text-xs text-slate-500 font-medium">
-                Last 7 days adherence consistency
-              </p>
-            </div>
-            <div className="text-right">
-              <span className="text-2xl font-black text-emerald-700">
-                {data.adherence_score_7d}%
-              </span>
-              <p className="text-[11px] text-slate-400 font-medium">Weekly adherence</p>
-            </div>
-          </div>
-
-          <div className="h-48 w-full pt-2">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={weeklyData} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
-                <XAxis
-                  dataKey="date"
-                  tickLine={false}
-                  axisLine={{ stroke: "#f1f5f9" }}
-                  tick={{ fill: "#64748b", fontSize: 12, fontWeight: 600 }}
-                />
-                <YAxis
-                  domain={[0, 100]}
-                  tickLine={false}
-                  axisLine={false}
-                  tick={{ fill: "#94a3b8", fontSize: 10 }}
-                  tickFormatter={(val) => `${val}%`}
-                />
-                <Tooltip
-                  content={({ active, payload }) => {
-                    if (active && payload && payload.length) {
-                      const item = payload[0].payload;
-                      return (
-                        <div className="bg-slate-900 text-white px-3 py-1.5 rounded-xl text-xs font-semibold shadow-lg">
-                          <p className="text-slate-300">{item.fullDate}</p>
-                          <p className="text-emerald-400 text-sm font-bold">
-                            Score: {item.score}%
-                          </p>
-                        </div>
-                      );
-                    }
-                    return null;
-                  }}
-                />
-                <Bar dataKey="score" radius={[6, 6, 0, 0]}>
-                  {weeklyData.map((entry, index) => {
-                    const color =
-                      entry.score >= 80
-                        ? "#059669"
-                        : entry.score >= 60
-                        ? "#d97706"
-                        : "#e11d48";
-                    return <Cell key={`cell-${index}`} fill={color} />;
-                  })}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-
-          <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
-            <div className="flex items-center gap-4">
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 inline-block" />
-                Good (&#x2265;80%)
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-amber-500 inline-block" />
-                Moderate (60-79%)
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-rose-500 inline-block" />
-                Low (&lt;60%)
-              </span>
-            </div>
-            <span className="font-semibold text-slate-800">
-              Weekly Adherence: {data.adherence_score_7d}%
-            </span>
-          </div>
-        </section>
-
-        {/* SECTION 3: MEDICATIONS & REMAINING SUPPLY */}
-        <section className="space-y-4">
-          <div className="px-1">
-            <h2 className="text-lg font-bold text-slate-900">Active Prescriptions</h2>
-            <p className="text-xs text-slate-500 font-medium">
-              Daily dosage instructions and remaining days of supply
-            </p>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {(data.medications || []).map((med) => {
-              const daysLeft = med.days_until_refill ?? 30;
-              const isUrgent = daysLeft <= 5;
-
-              return (
-                <div
-                  key={med.name}
-                  className={`p-5 rounded-3xl border bg-white shadow-xs flex flex-col justify-between ${
-                    isUrgent ? "border-amber-300 bg-amber-50/20" : "border-slate-200"
-                  }`}
-                >
-                  <div>
-                    <div className="flex items-start justify-between gap-2">
-                      <h3 className="font-bold text-slate-900 text-base">
-                        {med.name}
-                      </h3>
-                      {isUrgent && (
-                        <Badge variant="outline" className="text-[10px] font-bold bg-amber-100 text-amber-800 border-amber-300">
-                          Refill Soon
-                        </Badge>
-                      )}
-                    </div>
-
-                    <p className="text-xs text-slate-600 mt-1">
-                      Dosage: <strong>{med.dosage}</strong> &bull; {med.meal_timing.replace("_", " ")}
-                    </p>
-
-                    <div className="mt-3 flex items-center gap-1.5 flex-wrap">
-                      <span className="text-[11px] text-slate-400 font-medium">Timing:</span>
-                      {(med.frequency || []).map((f) => (
-                        <Badge
-                          key={f}
-                          variant="outline"
-                          className="capitalize text-[10px] bg-slate-50 text-slate-700 border-slate-200"
-                        >
-                          {f}
-                        </Badge>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
-                    <span className="text-slate-500">Estimated Supply:</span>
-                    <span className={`font-bold ${isUrgent ? "text-amber-800" : "text-slate-800"}`}>
-                      {med.pills_remaining !== null && med.pills_remaining !== undefined
-                        ? `${med.pills_remaining} pills (~${daysLeft} days)`
-                        : `~${daysLeft} days remaining`}
-                    </span>
-                  </div>
+        <section aria-labelledby="history-heading">
+          <Card className="border-slate-200 bg-white shadow-sm">
+            <CardHeader className="border-b border-slate-100 pb-4">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <CardTitle id="history-heading" className="text-xl text-slate-950">Seven-day adherence history</CardTitle>
+                  <p className="mt-1 text-sm text-slate-600">One backend-calculated score per day; no client-side percentage is invented.</p>
                 </div>
-              );
-            })}
-          </div>
+                <Badge variant="outline" className={`${adherenceStyle.badge} w-fit`}>{data.adherence_score_7d}% this week</Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="pt-5">
+              {weeklyData.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center text-sm text-slate-600">
+                  No adherence history is available yet.
+                </div>
+              ) : (
+                <div className="h-56 w-full" role="img" aria-label="Seven-day adherence bar chart">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={weeklyData} margin={{ top: 10, right: 10, left: -22, bottom: 0 }}>
+                      <XAxis dataKey="shortDate" tickLine={false} axisLine={{ stroke: "#cbd5e1" }} tick={{ fill: "#475569", fontSize: 12 }} />
+                      <YAxis domain={[0, 100]} tickLine={false} axisLine={false} tick={{ fill: "#64748b", fontSize: 11 }} tickFormatter={(value: number) => `${value}%`} />
+                      <Tooltip
+                        content={({ active, payload }) => {
+                          if (!active || !payload?.length) return null;
+                          const point = payload[0]?.payload as (typeof weeklyData)[number];
+                          return (
+                            <div className="rounded-xl bg-slate-950 px-3 py-2 text-xs text-white shadow-lg">
+                              <p className="text-slate-300">{point.fullDate}</p>
+                              <p className="mt-1 font-bold text-sky-300">{point.score}% adherence</p>
+                              <p className="mt-1 text-slate-400">{point.doses_taken} of {point.doses_expected} doses</p>
+                            </div>
+                          );
+                        }}
+                      />
+                      <Bar dataKey="score" radius={[6, 6, 0, 0]} isAnimationActive={false}>
+                        {weeklyData.map((point) => (
+                          <Cell key={point.date} fill={point.score >= 80 ? "#0284c7" : point.score >= 60 ? "#d97706" : "#e11d48"} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+              <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 border-t border-slate-100 pt-4 text-xs text-slate-600">
+                <span><span className="mr-1.5 inline-block h-2.5 w-2.5 rounded-full bg-sky-600" aria-hidden="true" />Good: 80% or higher</span>
+                <span><span className="mr-1.5 inline-block h-2.5 w-2.5 rounded-full bg-amber-500" aria-hidden="true" />Moderate: 60–79%</span>
+                <span><span className="mr-1.5 inline-block h-2.5 w-2.5 rounded-full bg-rose-600" aria-hidden="true" />Low: below 60%</span>
+              </div>
+            </CardContent>
+          </Card>
         </section>
 
-        {/* SECTION 4: RECENT ALERTS */}
-        <section className="space-y-4">
-          <div className="px-1">
-            <h2 className="text-lg font-bold text-slate-900">Recent Health Notes</h2>
-            <p className="text-xs text-slate-500 font-medium">
-              Important alerts recorded during daily voice conversations
-            </p>
+        <section className="space-y-3" aria-labelledby="medications-heading">
+          <div>
+            <h2 id="medications-heading" className="text-xl font-bold text-slate-950">Active prescriptions</h2>
+            <p className="mt-1 text-sm text-slate-600">Prescription directions and refill estimates supplied by the backend.</p>
           </div>
-
-          {recentAlerts.length === 0 ? (
-            <div className="p-6 rounded-3xl bg-white border border-slate-200 text-center text-xs text-slate-400">
-              No recent medical alerts or side effect reports.
-            </div>
+          {data.medications.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-600">No active medications found.</div>
           ) : (
-            <div className="space-y-2.5">
-              {recentAlerts.map((alert) => {
-                const isSideEffect = alert.alert_type === "side_effect" || alert.severity === "critical";
-                const isMissed = alert.alert_type === "missed_dose" || alert.severity === "warning";
-
+            <div className="grid gap-4 sm:grid-cols-2">
+              {data.medications.map((medication, index) => {
+                const hasSupply = medication.pills_remaining !== null && medication.pills_remaining !== undefined;
+                const daysUntilRefill = medication.days_until_refill;
+                const hasRefillEstimate = typeof daysUntilRefill === "number" && Number.isFinite(daysUntilRefill);
+                const isUrgent = hasRefillEstimate && daysUntilRefill <= 5;
                 return (
-                  <div
-                    key={alert.id}
-                    className={`p-4 rounded-2xl border flex items-start gap-3 ${
-                      isSideEffect
-                        ? "bg-rose-50 border-rose-200 text-rose-900"
-                        : isMissed
-                        ? "bg-amber-50 border-amber-200 text-amber-900"
-                        : "bg-white border-slate-200 text-slate-800"
-                    }`}
-                  >
-                    <div className="mt-0.5 shrink-0">
-                      {isSideEffect ? (
-                        <AlertCircle className="w-5 h-5 text-rose-600" />
-                      ) : (
-                        <AlertTriangle className="w-5 h-5 text-amber-600" />
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-bold uppercase tracking-wider">
-                          {alert.alert_type.replace("_", " ")}
-                        </span>
-                        <span className="text-[11px] opacity-70">
-                          {formatDate(alert.created_at, "MMM d, h:mm a")}
-                        </span>
+                  <Card key={`${medication.name}-${index}`} className={`border bg-white shadow-sm ${isUrgent ? "border-amber-300" : "border-slate-200"}`}>
+                    <CardContent className="p-5">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h3 className="font-semibold text-slate-950">{medication.name}</h3>
+                          <p className="mt-1 text-sm text-slate-700">{medication.dosage}</p>
+                        </div>
+                        {isUrgent && <Badge variant="outline" className="border-amber-300 bg-amber-50 text-amber-900">Refill soon</Badge>}
                       </div>
-                      <p className="text-xs mt-1 font-medium leading-relaxed">
-                        {alert.message}
+                      <p className="mt-3 text-xs text-slate-600">{formatMealTiming(medication.meal_timing)}</p>
+                      <div className="mt-3 flex flex-wrap gap-1.5">
+                        {medication.frequency.map((slot) => <Badge key={slot} variant="outline" className="border-sky-200 bg-sky-50 text-sky-800">{slot}</Badge>)}
+                      </div>
+                      <p className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-600">
+                        Supply: <span className="font-semibold text-slate-900">{hasSupply ? `${medication.pills_remaining} pills` : "Not available"}</span>
+                        {hasRefillEstimate && <span> · about {Math.ceil(daysUntilRefill)} days</span>}
                       </p>
-                    </div>
-                  </div>
+                    </CardContent>
+                  </Card>
                 );
               })}
             </div>
           )}
         </section>
 
-        {/* FOOTER */}
-        <footer className="pt-6 pb-8 border-t border-slate-200/80 text-center space-y-2">
-          <div className="flex items-center justify-center gap-1.5 text-xs font-bold text-slate-600">
-            <span>Powered by Nalam</span>
-            <Heart className="w-3.5 h-3.5 text-emerald-600 fill-emerald-600" />
+        <section className="space-y-3" aria-labelledby="alerts-heading">
+          <div>
+            <h2 id="alerts-heading" className="text-xl font-bold text-slate-950">Recent alerts</h2>
+            <p className="mt-1 text-sm text-slate-600">Escalations recorded from medication check-ins.</p>
           </div>
-          <p className="text-[11px] text-slate-400">
-            Data refreshes automatically every 60 seconds. Voice calls dial directly from
-            the Nalam Bolna Agent.
-          </p>
+          {recentAlerts.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-600">No recent alerts.</div>
+          ) : (
+            <div className="space-y-3">
+              {recentAlerts.map((alert) => (
+                <div key={alert.id} className={`rounded-2xl border bg-white p-4 ${alert.severity === "critical" ? "border-rose-200" : alert.severity === "warning" ? "border-amber-200" : "border-slate-200"}`}>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="flex items-start gap-3">
+                      {alert.severity === "critical" ? <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600" aria-hidden="true" /> : <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" aria-hidden="true" />}
+                      <div>
+                        <p className="text-xs font-bold uppercase tracking-wide text-slate-800">{alert.alert_type.replaceAll("_", " ")}</p>
+                        <p className="mt-1 text-sm leading-relaxed text-slate-700">{alert.message}</p>
+                      </div>
+                    </div>
+                    <p className="shrink-0 text-xs text-slate-500">{formatDate(alert.created_at, "MMM d, h:mm a")}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <footer className="border-t border-sky-200 pt-5 pb-6 text-xs leading-relaxed text-slate-600">
+          <div className="flex items-center gap-2 font-semibold text-slate-800"><ShieldCheck className="h-4 w-4 text-sky-700" aria-hidden="true" />Privacy and demo data</div>
+          <p className="mt-2">Nalam records medication responses to calculate adherence and generate configured family alerts. Use synthetic patient records in this demo workspace. Confirm backend recording, transcript, consent, and opt-out configuration before using real health information.</p>
+          {historyQuery.isError && <p className="mt-2 text-amber-800">Seven-day call history could not be loaded: {getApiErrorMessage(historyQuery.error)}</p>}
         </footer>
       </div>
-    </div>
+    </main>
   );
 }

@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Literal
 import uuid
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, status
@@ -16,7 +16,6 @@ from app.database import async_session_factory, engine
 from app.middleware import RequestLoggingMiddleware, ExceptionHandlingMiddleware
 from app.models import Patient, Medication, CallSchedule, Pharmacy
 from app.routers import adherence, dashboard, patients, webhooks, spec_aliases
-from app.utils.language import get_bolna_agent_id
 from app.services.bolna_service import BolnaService
 from app.services.twilio_service import TwilioService
 from app.services.scheduler_service import SchedulerService
@@ -258,8 +257,7 @@ async def root():
 
 class DemoTriggerRequest(BaseModel):
     phone: str = Field(..., description="Phone number with country code, e.g. +919876543210")
-    name: str = Field("Demo Patient", description="Patient name")
-    language: str = Field("hindi", description="'hindi', 'tamil', or 'english'")
+    language: Literal["tamil"] = Field("tamil", description="Nalam supports Tamil voice calls only")
     medication_name: str = Field("Metformin 500mg", description="Medication name")
     dosage: str = Field("1 tablet", description="Dosage")
     meal_relation: str = Field("after_meal", description="before_meal, after_meal, or with_meal")
@@ -275,92 +273,60 @@ async def trigger_demo_call(payload: DemoTriggerRequest, request: Request):
     bolna = request.app.state.bolna_service
     twilio = request.app.state.twilio_service
 
-    # Select appropriate agent
-    agent_id = get_bolna_agent_id(payload.language)
-    if not agent_id:
-        # Fallback to Hindi or Tamil if specific agent not configured
-        agent_id = settings.BOLNA_AGENT_ID_HINDI or settings.BOLNA_AGENT_ID_TAMIL or "demo-agent"
-
-    patient_id = str(uuid.uuid4())
-    medication_id = str(uuid.uuid4())
-
     async with async_session_factory() as session:
-        # Try to find existing demo patient with this phone or create one
         res = await session.execute(select(Patient).where(Patient.phone == payload.phone))
         existing_patient = res.scalar_one_or_none()
-
-        if existing_patient:
-            patient_id = str(existing_patient.id)
-            # Find or create medication
-            med_res = await session.execute(select(Medication).where(Medication.patient_id == existing_patient.id))
-            med = med_res.scalars().first()
-            if med:
-                medication_id = str(med.id)
-            else:
-                new_med = Medication(
-                    id=uuid.UUID(medication_id),
-                    patient_id=existing_patient.id,
-                    name=payload.medication_name,
-                    dosage=payload.dosage,
-                    frequency=[payload.time_slot],
-                    meal_timing=payload.meal_relation,
-                )
-                session.add(new_med)
-                await session.commit()
-        else:
-            new_patient = Patient(
-                id=uuid.UUID(patient_id),
-                name=payload.name,
-                phone=payload.phone,
-                language=payload.language,
-                family_contact_name="Family Caregiver",
-                family_whatsapp=payload.phone,
+        if not existing_patient or not existing_patient.is_active or not existing_patient.demo_only:
+            raise HTTPException(status_code=404, detail="Configured demo patient not found")
+        if existing_patient.consent_status.value != "granted":
+            raise HTTPException(status_code=403, detail="Patient consent is required before calling")
+        if existing_patient.language.value != "tamil":
+            raise HTTPException(status_code=422, detail="Configured demo patient must use Tamil")
+        med_res = await session.execute(
+            select(Medication).where(
+                Medication.patient_id == existing_patient.id,
+                Medication.is_active.is_(True),
             )
-            session.add(new_patient)
-            new_med = Medication(
-                id=uuid.UUID(medication_id),
-                patient_id=uuid.UUID(patient_id),
-                name=payload.medication_name,
-                dosage=payload.dosage,
-                frequency=[payload.time_slot],
-                meal_timing=payload.meal_relation,
-            )
-            session.add(new_med)
-            await session.commit()
+        )
+        med = med_res.scalars().first()
+        if not med:
+            raise HTTPException(status_code=422, detail="Configured demo patient has no active medication")
+        patient_id = str(existing_patient.id)
+        medication_id = str(med.id)
 
     user_data = {
-        "patient_name": payload.name,
-        "medication_name": payload.medication_name,
-        "dosage": payload.dosage,
-        "meal_relation": payload.meal_relation,
-        "language": payload.language,
+        "patient_name": existing_patient.name,
+        "medication_name": med.name,
+        "dosage": med.dosage,
+        "meal_timing": med.meal_timing.value,
+        "language": "tamil",
         "time_slot": payload.time_slot,
         "patient_id": patient_id,
         "medication_id": medication_id,
     }
 
-    logger.info(f"Triggering demo call to {payload.phone} with agent {agent_id}")
-    try:
-        call_res = await bolna.trigger_call(
-            agent_id=agent_id,
-            recipient_phone=payload.phone,
-            user_data=user_data,
-        )
-    except Exception as exc:
-        logger.error(f"Bolna call trigger failed: {exc}")
-        call_res = {"status": "simulated", "message": str(exc), "call_id": f"sim-{uuid.uuid4().hex[:8]}"}
+    if not settings.BOLNA_AGENT_ID_TAMIL:
+        raise HTTPException(status_code=503, detail="Tamil Bolna agent is not configured")
+    logger.info("Triggering demo call for patient_id=%s", patient_id)
+    call_res = await bolna.trigger_call(
+        agent_id=settings.BOLNA_AGENT_ID_TAMIL,
+        recipient_phone=existing_patient.phone,
+        user_data=user_data,
+    )
+    if call_res.get("error"):
+        raise HTTPException(status_code=502, detail="Bolna did not accept the demo call")
 
     # Broadcast event via websocket to show live on dashboard
     await broadcast_event("call_triggered", {
-        "patient_name": payload.name,
-        "phone": payload.phone,
-        "medication": payload.medication_name,
+        "patient_name": existing_patient.name,
+        "phone": existing_patient.phone,
+        "medication": med.name,
         "time_slot": payload.time_slot,
         "call_id": call_res.get("call_id"),
     })
 
     return {
-        "message": f"Demo call initiated to {payload.phone}",
+        "message": "Demo call accepted by Bolna",
         "call_result": call_res,
         "patient_id": patient_id,
         "medication_id": medication_id,
