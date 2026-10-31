@@ -331,3 +331,30 @@ async def trigger_demo_call(payload: DemoTriggerRequest, request: Request):
         "patient_id": patient_id,
         "medication_id": medication_id,
     }
+
+
+@app.post("/api/v1/test/send-test-whatsapp", tags=["Demo"])
+async def send_test_whatsapp(request: Request):
+    """
+    Send a test WhatsApp message to DEMO_FAMILY_WHATSAPP to verify Twilio sandbox
+    participation before the demo. Call this after the family member has sent
+    'join <sandbox-keyword>' to the Twilio sandbox number.
+    """
+    if not settings.DEMO_FAMILY_WHATSAPP:
+        raise HTTPException(
+            status_code=503,
+            detail="DEMO_FAMILY_WHATSAPP is not configured. Set it in backend/.env.",
+        )
+    twilio: TwilioService = request.app.state.twilio_service
+    result = await twilio.send_whatsapp(
+        to=settings.DEMO_FAMILY_WHATSAPP,
+        body="Nalam test message — sandbox verified. You will receive live demo alerts here.",
+    )
+    if result.get("error"):
+        detail = str(result.get("detail", "unknown"))
+        raise HTTPException(status_code=502, detail=f"WhatsApp test failed: {detail}")
+    return {
+        "message": "Test WhatsApp sent successfully",
+        "sid": result.get("sid"),
+        "to": settings.DEMO_FAMILY_WHATSAPP,
+    }

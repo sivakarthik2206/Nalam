@@ -114,6 +114,22 @@ class TwilioService:
                                 delay = float(attempt)
                             await asyncio.sleep(delay)
                             continue
+                        # Surface sandbox-specific errors as clear human-readable messages.
+                        # 63016 = recipient has not joined the Twilio sandbox
+                        # 63007 = WhatsApp channel not available / no active session
+                        try:
+                            err_body = response.json()
+                            twilio_code = int(err_body.get("code", 0))
+                        except Exception:
+                            twilio_code = 0
+                        if twilio_code in (63016, 63007):
+                            raise TwilioServiceError(
+                                "WhatsApp alert failed: recipient has not joined the Twilio sandbox. "
+                                "Ask the family member to send 'join <sandbox-keyword>' to "
+                                "+14155238886 on WhatsApp before alerts can be delivered.",
+                                retryable=False,
+                                status_code=response.status_code,
+                            )
                         raise TwilioServiceError(
                             f"Twilio message request failed with HTTP {response.status_code}",
                             retryable=retryable,

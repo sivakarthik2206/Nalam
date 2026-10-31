@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment files — contain real secrets, never commit
+backend/.env
+frontend/.env.local
+.env
+
+# Bolna rendered config — contains real backend URL and webhook secret
+# Regenerate with: cd backend && python -m scripts.render_bolna_config
+bolna-agents/bolna_agent_config.json
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Next.js
+frontend/.next/
+frontend/out/
+
+# Misc
+*.tmp
+*.bak
+backend_backup_pre_fix/

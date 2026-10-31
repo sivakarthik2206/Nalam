@@ -794,3 +794,198 @@ class TestTwilioTemplates:
         msg = svc.format_alert("side_effect", "Meenakshi", details, "english")
         assert "Metformin" in msg
         assert "dizzy" in msg
+
+
+# ---------------------------------------------------------------------------
+# 10. TWILIO SANDBOX ERROR DETECTION
+# ---------------------------------------------------------------------------
+
+class TestTwilioSandboxErrors:
+    """Twilio error codes 63016 and 63007 must surface a clear sandbox join message."""
+
+    @pytest.mark.asyncio
+    async def test_sandbox_63016_returns_human_readable_error(self):
+        """HTTP 400 with Twilio code 63016 must return a sandbox join error detail."""
+        import httpx
+        from unittest.mock import patch, AsyncMock
+        from app.services.twilio_service import TwilioService
+
+        svc = TwilioService("ACtest", "test-token", "whatsapp:+14155238886")
+
+        mock_response = MagicMock()
+        mock_response.is_error = True
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"code": 63016, "message": "From number not a sandbox participant"}
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value = mock_client
+
+            result = await svc.send_whatsapp("+919876543002", "test")
+
+        assert result.get("error") is True
+        detail = str(result.get("detail", ""))
+        assert "sandbox" in detail.lower(), f"Expected sandbox mention in: {detail}"
+        assert result.get("retryable") is False
+
+    @pytest.mark.asyncio
+    async def test_sandbox_63007_returns_human_readable_error(self):
+        """HTTP 400 with Twilio code 63007 must return a sandbox join error detail."""
+        import httpx
+        from unittest.mock import patch, AsyncMock
+        from app.services.twilio_service import TwilioService
+
+        svc = TwilioService("ACtest", "test-token", "whatsapp:+14155238886")
+
+        mock_response = MagicMock()
+        mock_response.is_error = True
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"code": 63007, "message": "WhatsApp channel not available"}
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value = mock_client
+
+            result = await svc.send_whatsapp("+919876543002", "test")
+
+        assert result.get("error") is True
+        detail = str(result.get("detail", ""))
+        assert "sandbox" in detail.lower(), f"Expected sandbox mention in: {detail}"
+        assert result.get("retryable") is False
+
+    @pytest.mark.asyncio
+    async def test_other_twilio_error_not_confused_with_sandbox(self):
+        """A generic Twilio 400 error (code 21211) must NOT return a sandbox message."""
+        from unittest.mock import patch, AsyncMock
+        from app.services.twilio_service import TwilioService
+
+        svc = TwilioService("ACtest", "test-token", "whatsapp:+14155238886")
+
+        mock_response = MagicMock()
+        mock_response.is_error = True
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"code": 21211, "message": "Invalid To phone number"}
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value = mock_client
+
+            result = await svc.send_whatsapp("+919876543002", "test")
+
+        assert result.get("error") is True
+        detail = str(result.get("detail", ""))
+        assert "HTTP 400" in detail, f"Expected generic HTTP error in: {detail}"
+
+
+# ---------------------------------------------------------------------------
+# 11. TEST-WHATSAPP ENDPOINT
+# ---------------------------------------------------------------------------
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _make_test_client_with_mocked_services(twilio_mock, family_wa: str):
+    """
+    Context manager yielding a TestClient with lifespan-level mocks injected.
+    Patches _create_twilio_service/_create_scheduler_service so the startup
+    lifespan uses our mocks instead of hitting real Twilio or the SQLite DB.
+    """
+    from fastapi.testclient import TestClient
+    import app.main as main_module
+    from app.config import settings
+
+    mock_scheduler = MagicMock()
+    mock_scheduler.start = AsyncMock()
+    mock_scheduler.stop = AsyncMock()
+    mock_scheduler.is_running = False
+
+    mock_bolna = MagicMock()
+    mock_bolna.close = AsyncMock()
+
+    settings.DEMO_FAMILY_WHATSAPP = family_wa
+
+    with patch.object(main_module, "_create_twilio_service", return_value=twilio_mock), \
+         patch.object(main_module, "_create_bolna_service", return_value=mock_bolna), \
+         patch.object(main_module, "_create_scheduler_service", return_value=mock_scheduler):
+        with TestClient(main_module.app, raise_server_exceptions=False) as client:
+            yield client
+
+
+class TestSendTestWhatsapp:
+    """POST /api/v1/test/send-test-whatsapp endpoint tests."""
+
+    def test_endpoint_registered(self):
+        from app.main import app
+        paths = [r.path for r in app.routes]
+        assert "/api/v1/test/send-test-whatsapp" in paths, (
+            f"/api/v1/test/send-test-whatsapp not registered. Routes: {paths}"
+        )
+
+    def test_returns_503_when_demo_family_whatsapp_not_set(self):
+        mock_twilio = MagicMock()
+        mock_twilio.send_whatsapp = AsyncMock(return_value={"sid": "SMtest"})
+        with _make_test_client_with_mocked_services(mock_twilio, family_wa="") as client:
+            resp = client.post("/api/v1/test/send-test-whatsapp")
+            assert resp.status_code == 503
+
+    def test_returns_200_when_twilio_succeeds(self):
+        mock_twilio = MagicMock()
+        mock_twilio.send_whatsapp = AsyncMock(return_value={"sid": "SMabc123"})
+        with _make_test_client_with_mocked_services(mock_twilio, family_wa="+919876543002") as client:
+            resp = client.post("/api/v1/test/send-test-whatsapp")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["sid"] == "SMabc123"
+
+    def test_returns_502_when_twilio_fails(self):
+        mock_twilio = MagicMock()
+        mock_twilio.send_whatsapp = AsyncMock(return_value={
+            "error": True,
+            "detail": "WhatsApp alert failed: recipient has not joined the Twilio sandbox.",
+            "retryable": False,
+        })
+        with _make_test_client_with_mocked_services(mock_twilio, family_wa="+919876543002") as client:
+            resp = client.post("/api/v1/test/send-test-whatsapp")
+            assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# 12. BOLNA AGENT TEMPLATE — NO UNRESOLVED PLACEHOLDERS
+# ---------------------------------------------------------------------------
+
+class TestBolnaConfigTemplate:
+    """bolna_agent_config.template.json must not contain unresolved {{...}} when rendered."""
+
+    def test_template_exists(self):
+        from pathlib import Path
+        template = Path(__file__).resolve().parent.parent.parent / "bolna-agents" / "bolna_agent_config.template.json"
+        assert template.exists(), f"Template not found at {template}"
+
+    def test_rendered_output_has_no_unresolved_placeholders(self, tmp_path):
+        """render_bolna_config.py with fake env values must produce a placeholder-free file."""
+        import json
+        import re
+        from pathlib import Path
+
+        template = Path(__file__).resolve().parent.parent.parent / "bolna-agents" / "bolna_agent_config.template.json"
+        text = template.read_text(encoding="utf-8")
+        rendered = (
+            text
+            .replace("{{BACKEND_PUBLIC_URL}}", "https://test.up.railway.app")
+            .replace("{{BOLNA_WEBHOOK_SECRET}}", "test-secret-value")
+        )
+        remaining = re.findall(r"\{\{[^}]+\}\}", rendered)
+        assert remaining == [], f"Unresolved placeholders after substitution: {remaining}"
+        # Must also be valid JSON
+        parsed = json.loads(rendered)
+        assert isinstance(parsed, dict)

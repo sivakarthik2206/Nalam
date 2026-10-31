@@ -1,0 +1,107 @@
+{
+  "_comment": "One Tamil-only Nalam agent. Replace the HTTPS placeholders and secret before importing into Bolna. The ASR, LLM, and TTS providers below are selected from Bolna's preferred bundled model set.",
+  "agents": {
+    "tamil": {
+      "name": "Nalam Tamil Medication Adherence Assistant",
+      "description": "Tamil-only medication adherence calls for consented elderly patients.",
+      "language": "ta",
+      "locale": "ta-IN",
+      "voice_provider": "maya",
+      "voice_model": "Maya 2 Native",
+      "voice_id": "Ananya",
+      "asr_provider": "soniox",
+      "asr_model": "stt-rt-v5",
+      "asr_language": "ta",
+      "llm_provider": "openai",
+      "llm_model": "gpt-5.4-mini",
+      "max_duration_seconds": 90,
+      "first_message": "வணக்கம். நான் நலம் உதவியாளர் பேசுகிறேன். {patient_name} அவர்களுடன் பேசுகிறேனா? எப்படி இருக்கிறீர்கள்?",
+      "webhook_url": "{{BACKEND_PUBLIC_URL}}/api/v1/webhooks/bolna",
+      "system_prompt_file": "tamil-agent-prompt.md",
+      "context_variables": [
+        "patient_name",
+        "time_slot",
+        "medication_name",
+        "dosage",
+        "meal_timing",
+        "patient_id",
+        "medication_id",
+        "language"
+      ],
+      "tools": [
+        {
+          "name": "report_adherence",
+          "description": "Call exactly once after the conversation ends. Send only the validated medication outcome collected from the intended patient.",
+          "url": "{{BACKEND_PUBLIC_URL}}/api/v1/webhooks/bolna/function",
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json",
+            "X-Bolna-Webhook-Secret": "{{BOLNA_WEBHOOK_SECRET}}"
+          },
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "patient_id": {
+                "type": "string",
+                "description": "Patient UUID from call context"
+              },
+              "medication_id": {
+                "type": "string",
+                "description": "Medication UUID from call context"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "TAKEN",
+                  "MISSED",
+                  "SIDE_EFFECT",
+                  "NO_ANSWER",
+                  "STOCK_OUT",
+                  "CALLBACK_REQUESTED"
+                ]
+              },
+              "side_effect_noted": {
+                "type": "boolean"
+              },
+              "retry_required": {
+                "type": "boolean"
+              },
+              "notes": {
+                "type": "string",
+                "description": "Short patient-reported symptom or reason, without diagnosis"
+              },
+              "time_slot": {
+                "type": "string",
+                "enum": ["morning", "afternoon", "evening", "night"]
+              },
+              "bolna_call_id": {
+                "type": "string",
+                "description": "Bolna execution identifier when available"
+              }
+            },
+            "required": [
+              "patient_id",
+              "medication_id",
+              "outcome",
+              "side_effect_noted",
+              "retry_required"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  },
+  "deployment_notes": {
+    "backend_url": "Use a public HTTPS backend URL; Bolna cannot reach localhost.",
+    "webhook_secret": "Set the same high-entropy BOLNA_WEBHOOK_SECRET in the backend and the Bolna custom-tool header.",
+    "agent_id_env": "Set the imported Tamil agent ID as BOLNA_AGENT_ID_TAMIL.",
+    "import_steps": [
+      "1. Deploy the backend or expose it through a secure HTTPS tunnel.",
+      "2. Replace {{BACKEND_PUBLIC_URL}} and {{BOLNA_WEBHOOK_SECRET}} before importing.",
+      "3. Import the Tamil agent and verify its published webhook/tool URLs.",
+      "4. Set BOLNA_API_KEY and BOLNA_AGENT_ID_TAMIL in the backend environment.",
+      "5. Test with a consented synthetic Tamil patient before any real patient data."
+    ]
+  }
+}

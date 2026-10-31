@@ -1,3 +1,5 @@
+from typing import Any
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,9 +32,24 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "http://localhost:3000"
     DEMO_FAMILY_WHATSAPP: str = ""
     DEMO_MODE: bool = False
-    DEMO_RETRY_DELAY_SECONDS: int = 1800
+    # Optional int — leave blank (or omit) to use the 30-minute production default.
+    # Set to a small integer (e.g. 30) for fast local demo runs only.
+    DEMO_RETRY_DELAY_SECONDS: int | None = None
     DEFAULT_TIMEZONE: str = "Asia/Kolkata"
     LOG_LEVEL: str = "INFO"
+
+    @field_validator("DEMO_RETRY_DELAY_SECONDS", mode="before")
+    @classmethod
+    def _coerce_blank_int(cls, v: Any) -> Any:
+        """Accept empty-string env values for Optional[int] fields without crashing.
+
+        pydantic-settings v2 does not coerce '' → None for int | None fields.
+        Any Optional int/float field added to this class should reuse this
+        validator or extend it here.
+        """
+        if v == "" or v is None:
+            return None
+        return v
 
     @property
     def effective_database_url(self) -> str:

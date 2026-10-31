@@ -16,7 +16,7 @@
       "llm_model": "gpt-5.4-mini",
       "max_duration_seconds": 90,
       "first_message": "வணக்கம். நான் நலம் உதவியாளர் பேசுகிறேன். {patient_name} அவர்களுடன் பேசுகிறேனா? எப்படி இருக்கிறீர்கள்?",
-      "webhook_url": "{{BACKEND_PUBLIC_URL}}/api/v1/webhooks/bolna",
+      "webhook_url": "https://nalam-demo.up.railway.app/api/v1/webhooks/bolna",
       "system_prompt_file": "tamil-agent-prompt.md",
       "context_variables": [
         "patient_name",
@@ -32,11 +32,11 @@
         {
           "name": "report_adherence",
           "description": "Call exactly once after the conversation ends. Send only the validated medication outcome collected from the intended patient.",
-          "url": "{{BACKEND_PUBLIC_URL}}/api/v1/webhooks/bolna/function",
+          "url": "https://nalam-demo.up.railway.app/api/v1/webhooks/bolna/function",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json",
-            "X-Bolna-Webhook-Secret": "{{BOLNA_WEBHOOK_SECRET}}"
+            "X-Bolna-Webhook-Secret": "testwebhooksecret1234567890abcdef"
           },
           "parameters": {
             "type": "object",
@@ -72,7 +72,12 @@
               },
               "time_slot": {
                 "type": "string",
-                "enum": ["morning", "afternoon", "evening", "night"]
+                "enum": [
+                  "morning",
+                  "afternoon",
+                  "evening",
+                  "night"
+                ]
               },
               "bolna_call_id": {
                 "type": "string",
@@ -98,7 +103,7 @@
     "agent_id_env": "Set the imported Tamil agent ID as BOLNA_AGENT_ID_TAMIL.",
     "import_steps": [
       "1. Deploy the backend or expose it through a secure HTTPS tunnel.",
-      "2. Replace {{BACKEND_PUBLIC_URL}} and {{BOLNA_WEBHOOK_SECRET}} before importing.",
+      "2. Replace https://nalam-demo.up.railway.app and testwebhooksecret1234567890abcdef before importing.",
       "3. Import the Tamil agent and verify its published webhook/tool URLs.",
       "4. Set BOLNA_API_KEY and BOLNA_AGENT_ID_TAMIL in the backend environment.",
       "5. Test with a consented synthetic Tamil patient before any real patient data."

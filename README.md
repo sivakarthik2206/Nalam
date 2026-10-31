@@ -144,13 +144,83 @@ The tests prove local contracts using SQLite and provider mocks. They do not pro
 
 ## Deployment
 
+### Numbered deployment sequence
+
+Complete in order. Steps that need a URL you don't have yet are marked — come back after the step that produces it.
+
+**1. Collect credentials**
+- Railway PostgreSQL URL (change scheme to `postgresql+asyncpg://`)
+- Bolna API key (dashboard → API Keys)
+- Twilio Account SID + Auth Token (Twilio console → Account Info)
+- Generate webhook secret: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+**2. Deploy backend to Railway**
+1. Push repo to GitHub; create a Railway project from the repo.
+2. Add a PostgreSQL plugin; Railway injects `DATABASE_URL` automatically.
+3. Set Railway environment variables (Settings → Variables) using `backend/.env.example` as a guide. Leave `BOLNA_AGENT_ID_TAMIL` and `BACKEND_PUBLIC_URL` blank for now.
+4. First deploy runs `alembic upgrade head` then starts Uvicorn.
+5. Copy the Railway public URL shown in the deploy log.
+6. Set `BACKEND_PUBLIC_URL=https://<your-railway-url>` in Railway variables and redeploy.
+7. Verify: `curl https://<your-railway-url>/health` → `{"status":"ok"}`
+
+**3. Import Bolna Tamil agent**
+1. Fill `BACKEND_PUBLIC_URL` and `BOLNA_WEBHOOK_SECRET` in `backend/.env`.
+2. Render the agent config: `cd backend && python -m scripts.render_bolna_config`
+3. Bolna dashboard → Agents → Import → upload `bolna-agents/bolna_agent_config.json`.
+4. Copy the agent UUID; set `BOLNA_AGENT_ID_TAMIL=<uuid>` in Railway variables.
+5. In Bolna agent settings, add header `X-Bolna-Webhook-Secret: <your secret>`.
+
+**4. Deploy frontend to Vercel**
+> `NEXT_PUBLIC_API_URL` is baked into the Next.js bundle at build time — set it **before** the Vercel build runs.
+
+1. New Vercel project → import repo → Root Directory: `frontend`.
+2. Add environment variable `NEXT_PUBLIC_API_URL=https://<your-railway-url>` in Vercel.
+3. Deploy.
+4. Copy Vercel URL; update Railway variables: `APP_BASE_URL`, `FRONTEND_ORIGIN`, `CORS_ORIGINS`.
+
+**5. Seed demo data**
+```bash
+cd backend
+DATABASE_URL=postgresql+asyncpg://... python -m scripts.seed_demo
+```
+Confirms: 1 Tamil patient (Meenakshi Sundaram), 2 medications, 7 days history.
+
+**6. Verify Twilio sandbox participation**
+1. Family member sends `join <sandbox-keyword>` to WhatsApp `+14155238886`.
+   (Keyword in Twilio console → Messaging → Try it out → Send a WhatsApp message)
+2. Verify: `curl -X POST https://<your-railway-url>/api/v1/test/send-test-whatsapp`
+   - Success: `{"message":"Test WhatsApp sent successfully","sid":"SM..."}`
+   - Failure: `WhatsApp alert failed: recipient has not joined the Twilio sandbox` → repeat step 1.
+
+**7. Run smoke test**
+```bash
+# Trigger demo call
+curl -X POST https://<your-railway-url>/api/v1/test/trigger-demo \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"+919876543001"}'
+
+# Check health
+curl https://<your-railway-url>/health
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `404` on trigger-demo | Patient not seeded with `demo_only=True` | Re-run `seed_demo.py` |
+| `503 Tamil Bolna agent is not configured` | `BOLNA_AGENT_ID_TAMIL` not set | Complete step 3 |
+| `WhatsApp alert failed: recipient has not joined the Twilio sandbox` | Sandbox join not completed | Complete step 6 |
+| Frontend shows CORS error or wrong data | `NEXT_PUBLIC_API_URL` baked with wrong value | Update Vercel env var and **redeploy** |
+| Railway deploy fails at `alembic upgrade head` | `DATABASE_URL` wrong scheme | Use `postgresql+asyncpg://` not `postgresql://` |
+| `ValidationError` on `DEMO_RETRY_DELAY_SECONDS` | Old code without blank-string coercion | Ensure latest code is deployed |
+
 ### Backend
 
-`Procfile` and `railway.toml` start one Uvicorn worker and run `alembic upgrade head` before startup. Provide PostgreSQL, `DATABASE_URL`, the server-only provider credentials, `BACKEND_PUBLIC_URL`, `APP_BASE_URL`, and an explicit `CORS_ORIGINS`. Verify `/health` and database readiness after deployment. Because the scheduler is in-process, do not scale the web process horizontally.
+`railway.toml` starts one Uvicorn worker and runs `alembic upgrade head` before startup. Provide PostgreSQL, `DATABASE_URL`, the server-only provider credentials, `BACKEND_PUBLIC_URL`, `APP_BASE_URL`, and an explicit `CORS_ORIGINS`. Verify `/health` and database readiness after deployment. Because the scheduler is in-process, do not scale the web process horizontally.
 
 ### Frontend
 
-Create a Vercel project with root directory `frontend`, use the Next.js preset, and set `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` to the deployed backend. Never put database, Bolna, Twilio, or webhook credentials in Vercel variables.
+Create a Vercel project with root directory `frontend`, use the Next.js preset, and set `NEXT_PUBLIC_API_URL` to the deployed backend URL. Never put database, Bolna, Twilio, or webhook credentials in Vercel variables.
 
 ## Demo sequence
 

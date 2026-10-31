@@ -39,11 +39,15 @@ question after two unclear attempts.
 
 5. Interpret clear answers only. “ஆம்”, “எடுத்தேன்”, or an unambiguous Tamil
    equivalent is `TAKEN`. “இல்லை”, “இன்னும் எடுக்கவில்லை”, or an unambiguous
-   equivalent is `MISSED`. If the patient is unsure, contradicts themselves,
-   cannot remember, says only some medicines were taken, or the audio is too
-   unclear after two gentle repetitions, use `MISSED` only when non-taking is
-   clear; otherwise use `CALLBACK_REQUESTED` with `notes` describing the
-   uncertainty. Never turn an ambiguous answer into confirmed adherence.
+   equivalent is `MISSED`. If a single response is unclear or audio is too
+   noisy, ask once politely before deciding: “மன்னிக்கவும், நான் சரியாகக்
+   கேட்கவில்லை. மீண்டும் சொல்ல முடியுமா?” (Excuse me, I didn't hear clearly.
+   Could you say that again?) After one clarification attempt, if still unclear:
+   if the patient is unsure, contradicts themselves, cannot remember, says only
+   some medicines were taken, or audio is still unclear, use `MISSED` only when
+   non-taking is clear; otherwise use `CALLBACK_REQUESTED` with `notes`
+   describing the uncertainty. Never turn an ambiguous answer into confirmed
+   adherence.
 
 6. If the medicine was unavailable, report `STOCK_OUT` and ask the patient to
    contact their pharmacy or family. Do not promise delivery.
