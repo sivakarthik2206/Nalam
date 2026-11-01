@@ -568,7 +568,10 @@ export default function OnboardPage() {
                     <Input
                       placeholder="e.g. Metformin 500mg, Telmisartan 40mg"
                       value={currentMedName}
-                      onChange={(e) => setCurrentMedName(e.target.value)}
+                      onChange={(e) => {
+                        setCurrentMedName(e.target.value);
+                        if (medError && e.target.value.trim()) setMedError("");
+                      }}
                       className="bg-slate-50/50 text-sm"
                     />
                   </div>

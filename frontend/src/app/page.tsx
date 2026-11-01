@@ -160,7 +160,7 @@ export default function Home() {
             <span>Nalam (நலம்) — AI Voice Health Companion</span>
           </div>
           <div>
-            Built with ❤️ by <span className="font-semibold text-slate-800">Siva Karthik</span> | VIT Chennai
+            Built with ❤️ by <span className="font-semibold text-slate-800">Siva Karthik</span>
           </div>
         </div>
       </footer>

@@ -1,6 +1,26 @@
 import axios, { AxiosError, AxiosInstance, InternalAxiosRequestConfig } from "axios";
 
-const baseURL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+function resolveApiBaseUrl(): string {
+  const raw = process.env.NEXT_PUBLIC_API_URL;
+
+  if (raw) {
+    // Strip trailing slash; keep whatever path the user provided (e.g. /api/v1)
+    return raw.replace(/\/+$/, "");
+  }
+
+  if (process.env.NODE_ENV !== "production") {
+    return "http://localhost:8000/api/v1";
+  }
+
+  console.error(
+    "[Nalam] NEXT_PUBLIC_API_URL is not set. " +
+      "Add it to your Vercel environment variables: " +
+      "NEXT_PUBLIC_API_URL=https://nalam-backend-ql9u.onrender.com/api/v1"
+  );
+  return ""; // will surface as a clear network error rather than a silent localhost hit
+}
+
+const baseURL = resolveApiBaseUrl();
 
 export const api: AxiosInstance = axios.create({
   baseURL,

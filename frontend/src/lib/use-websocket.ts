@@ -29,41 +29,61 @@ function isDashboardSocketMessage(value: unknown): value is DashboardSocketMessa
   });
 }
 
+/**
+ * Derive the WebSocket URL from NEXT_PUBLIC_API_URL.
+ * The env var is expected to be the full API base (e.g. https://host/api/v1).
+ * We replace the protocol and append /ws/dashboard.
+ * In development with no env var we fall back to localhost.
+ */
+function resolveWsUrl(): string {
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "");
+
+  if (apiUrl) {
+    const wsBase = apiUrl
+      .replace(/^https:\/\//, "wss://")
+      .replace(/^http:\/\//, "ws://");
+    return `${wsBase}/ws/dashboard`;
+  }
+
+  if (process.env.NODE_ENV !== "production") {
+    return "ws://localhost:8000/api/v1/ws/dashboard";
+  }
+
+  console.error(
+    "[Nalam WS] NEXT_PUBLIC_API_URL is not set — live dashboard stream disabled."
+  );
+  return "";
+}
+
+const WS_URL = resolveWsUrl();
+
 export function useDashboardWebSocket() {
   const queryClient = useQueryClient();
   const socketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    // Resolve WS URL from env or fallback to localhost
-    const rawWs = process.env.NEXT_PUBLIC_WS_URL;
-    let wsUrl = "ws://localhost:8000/api/v1/ws/dashboard";
-
-    if (rawWs) {
-      wsUrl = rawWs;
-    } else if (typeof window !== "undefined") {
-      const isHttps = window.location.protocol === "https:";
-      const host = window.location.hostname;
-      // If deployed or local
-      wsUrl = `${isHttps ? "wss" : "ws"}://${host}:8000/api/v1/ws/dashboard`;
-    }
+    if (!WS_URL) return;
 
     let isCancelled = false;
-    let reconnectTimeout: NodeJS.Timeout;
+    let reconnectTimeout: ReturnType<typeof setTimeout>;
+    let retryDelay = 1000;
+    const MAX_DELAY = 30000;
 
     function connect() {
       if (isCancelled) return;
 
       try {
-        const socket = new WebSocket(wsUrl);
+        const socket = new WebSocket(WS_URL);
         socketRef.current = socket;
 
         socket.onopen = () => {
+          retryDelay = 1000; // reset backoff on successful connection
           console.log("[Nalam WS] Connected to live dashboard stream");
         };
 
         socket.onmessage = (event) => {
           try {
-            const data: unknown = JSON.parse(event.data);
+            const data: unknown = JSON.parse(event.data as string);
             if (!isDashboardSocketMessage(data)) return;
             const message = data;
             const eventType = message.event;
@@ -95,22 +115,25 @@ export function useDashboardWebSocket() {
               });
             }
           } catch {
-            // Non-JSON message (e.g. pong)
+            // Non-JSON message (e.g. pong) — ignore silently
           }
         };
 
         socket.onclose = () => {
           if (!isCancelled) {
-            reconnectTimeout = setTimeout(connect, 4000);
+            retryDelay = Math.min(retryDelay * 2, MAX_DELAY);
+            reconnectTimeout = setTimeout(connect, retryDelay);
           }
         };
 
         socket.onerror = () => {
+          // onclose fires after onerror; backoff handled there
           socket.close();
         };
       } catch {
         if (!isCancelled) {
-          reconnectTimeout = setTimeout(connect, 5000);
+          retryDelay = Math.min(retryDelay * 2, MAX_DELAY);
+          reconnectTimeout = setTimeout(connect, retryDelay);
         }
       }
     }
